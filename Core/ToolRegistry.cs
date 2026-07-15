@@ -1,10 +1,12 @@
-// TxAgent / Core / ToolRegistry.cs
-// 工具注册表：按名注册/查找，并构造发给 API 的工具声明列表。
+// TxTools.Agent / Core / ToolRegistry.cs
+// 工具注册表:按名注册/查找,并构造发给 API 的工具声明列表。
+//
+// v3: 新增 Tools 只读枚举,供 UI 列出全部已注册工具。
 
 using System;
 using System.Collections.Generic;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class ToolRegistry
     {
@@ -12,6 +14,9 @@ namespace TxAgent.Core
             new Dictionary<string, ITxAgentTool>(StringComparer.Ordinal);
 
         public int Count { get { return _map.Count; } }
+
+        /// <summary>已注册工具的只读枚举(按注册顺序不保证,内部是 Dictionary)。供 UI 展示。</summary>
+        public IEnumerable<ITxAgentTool> Tools { get { return _map.Values; } }
 
         public void Register(ITxAgentTool tool)
         {

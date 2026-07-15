@@ -1,11 +1,11 @@
-// TxAgent / Tools / SceneTreeTools.cs
+// TxTools.Agent / Tools / SceneTreeTools.cs
 // 真实遍历场景对象树的只读工具。给模型"有据可依"的数据，避免从操作列表脑补对象/数量。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     /// <summary>按类型统计/枚举场景对象。回答"场景里有多少机器人/夹具/…"。</summary>
     public sealed class CountObjectsTool : TxAgentToolBase

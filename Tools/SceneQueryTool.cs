@@ -1,12 +1,12 @@
-// TxAgent / Tools / SceneQueryTool.cs
+// TxTools.Agent / Tools / SceneQueryTool.cs
 // 只读示例工具：查询当前 PS 场景状态 (选中对象 / 当前文档)。
 // 演示"只读 -> 免审批直跑"的模式，是模型行动前了解场景的基础工具。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class SceneQueryTool : TxAgentToolBase
     {

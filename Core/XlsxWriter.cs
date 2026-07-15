@@ -1,4 +1,4 @@
-// TxAgent / Core / XlsxWriter.cs
+// TxTools.Agent / Core / XlsxWriter.cs
 // 通用 .xlsx 写出：手写最小 Open XML (SpreadsheetML)，单元格用 inlineStr (全字符串)，
 // 避开 sharedStrings / 数字格式的复杂度，结构对 Office365/WPS 都兼容。UTF-8 无 BOM。
 // 参考 ExcelExporter.cs 的 Open XML 骨架，泛化为任意列。
@@ -9,7 +9,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Text;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public static class XlsxWriter
     {

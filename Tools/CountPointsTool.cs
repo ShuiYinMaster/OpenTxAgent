@@ -1,12 +1,12 @@
-// TxAgent / Tools / CountPointsTool.cs
+// TxTools.Agent / Tools / CountPointsTool.cs
 // 只读：统计当前选中操作里指定类型的点数 (按 op 分列 + 合计)。
 // 带参数的原语，适合做配方里的"先点检"步骤。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class CountPointsTool : TxAgentToolBase
     {

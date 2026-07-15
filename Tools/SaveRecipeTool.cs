@@ -1,4 +1,4 @@
-// TxAgent / Tools / SaveRecipeTool.cs
+// TxTools.Agent / Tools / SaveRecipeTool.cs
 // 让 agent 把一段验证过、可复用的多步操作保存成新工具(配方)。
 // 保存动作本身不改场景，故 IsReadOnly=true(免审批)；但配方一旦含变更步骤，
 // 它"执行时"仍会按变更处理、需用户确认。
@@ -7,9 +7,9 @@ using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class SaveRecipeTool : ITxAgentTool
     {

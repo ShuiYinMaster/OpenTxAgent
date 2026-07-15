@@ -1,4 +1,4 @@
-// TxAgent / Core / AuditLog.cs
+// TxTools.Agent / Core / AuditLog.cs
 // 变更类工具的审计日志：每次变更操作(审批通过/拒绝/执行结果)追加一行到插件文件夹 audit.log。
 // 尽力而为，失败静默(不影响对话)。路径策略与其他 Store 一致。
 
@@ -7,7 +7,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public static class AuditLog
     {
@@ -40,7 +40,7 @@ namespace TxAgent.Core
             catch { }
 
             var localDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxAgent");
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent");
 
             if (string.IsNullOrEmpty(pluginDir))
                 return new[] { Path.Combine(localDir, FileName) };

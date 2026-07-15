@@ -1,6 +1,6 @@
-// TxAgent / Core / KeyStore.cs
+// TxTools.Agent / Core / KeyStore.cs
 // API key 的本地持久化。默认写入插件文件夹 (随程序集)，用 DPAPI 按当前用户加密，不存明文。
-// 若插件目录不可写 (例如部署在 Program Files)，自动回退到 %LOCALAPPDATA%\TxAgent。
+// 若插件目录不可写 (例如部署在 Program Files)，自动回退到 %LOCALAPPDATA%\TxTools.Agent。
 
 using System;
 using System.IO;
@@ -8,7 +8,7 @@ using System.Reflection;
 using System.Security.Cryptography; // 需引用 System.Security
 using System.Text;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public static class KeyStore
     {
@@ -79,7 +79,7 @@ namespace TxAgent.Core
             catch { /* 忽略 */ }
 
             var localDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxAgent");
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent");
 
             if (string.IsNullOrEmpty(pluginDir))
                 return new[] { Path.Combine(localDir, FileName) };

@@ -1,16 +1,16 @@
-// TxAgent / UI / ConversationListDialog.cs
+// TxTools.Agent / UI / ConversationListDialog.cs
 // 历史对话列表：列出过往对话(标题+时间)，可打开或删除。返回所选对话 Id(null=取消)。
 
 using System;
 using System.Drawing;
 using System.Windows.Forms;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
 using Button = System.Windows.Forms.Button;
 using Label = System.Windows.Forms.Label;
 using ListBox = System.Windows.Forms.ListBox;
 
-namespace TxAgent.UI
+namespace TxTools.Agent.UI
 {
     public sealed class ConversationListDialog : Form
     {

@@ -1,4 +1,4 @@
-// TxAgent / Core / LlmModels.cs
+// TxTools.Agent / Core / LlmModels.cs
 // DeepSeek (OpenAI 兼容) Chat Completions 的数据契约。
 // 纯 .NET，不依赖 Process Simulate。C# 7.3 / .NET Framework 4.8。
 // 依赖: Newtonsoft.Json (放 libs\ 用 HintPath 引用)。
@@ -7,7 +7,7 @@ using System.Collections.Generic;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     /// <summary>POST /chat/completions 的请求体。</summary>
     public sealed class ChatRequest
@@ -73,12 +73,20 @@ namespace TxAgent.Core
         [JsonProperty("parameters")] public JObject Parameters { get; set; }
     }
 
+    /// <summary>API 返回的 token 用量（prompt_tokens / completion_tokens / total_tokens）。</summary>
+    public sealed class TokenUsage
+    {
+        [JsonProperty("prompt_tokens")]     public int PromptTokens { get; set; }
+        [JsonProperty("completion_tokens")] public int CompletionTokens { get; set; }
+        [JsonProperty("total_tokens")]      public int TotalTokens { get; set; }
+    }
+
     public sealed class ChatResponse
     {
         [JsonProperty("id")] public string Id { get; set; }
         [JsonProperty("model")] public string Model { get; set; }
         [JsonProperty("choices")] public List<Choice> Choices { get; set; }
-        [JsonProperty("usage")] public JObject Usage { get; set; }
+        [JsonProperty("usage")] public TokenUsage Usage { get; set; }
     }
 
     public sealed class Choice

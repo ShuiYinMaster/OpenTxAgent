@@ -1,4 +1,4 @@
-// TxAgent / Ps / ApiInspector.cs
+// TxTools.Agent / Ps / ApiInspector.cs
 // 反射式 API 探查：让 AI 从内部读懂 PS SDK 的真实 API，再据此写代码(run_csharp)。
 // 思路接你的 DiagnoseApi.cs：搜类型、列成员、探活动对象的成员与取值。
 
@@ -9,7 +9,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 
-namespace TxAgent.Ps
+namespace TxTools.Agent.Ps
 {
     public static class ApiInspector
     {

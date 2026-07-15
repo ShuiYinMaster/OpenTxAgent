@@ -1,10 +1,10 @@
-// TxAgent / Core / ITxAgentTool.cs
+// TxTools.Agent / Core / ITxAgentTool.cs
 // agent 可调用的工具契约。每个工具就是一个带 JSON Schema 的可调用函数。
 // Execute 始终在 PS 的 UI 主线程上下文中被调用 (见 AgentLoop 的线程说明)。
 
 using Newtonsoft.Json.Linq;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public interface ITxAgentTool
     {

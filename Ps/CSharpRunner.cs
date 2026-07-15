@@ -1,4 +1,4 @@
-// TxAgent / Ps / CSharpRunner.cs
+// TxTools.Agent / Ps / CSharpRunner.cs
 // 进程内编译执行用户(AI)提供的 C# 代码。用 .NET Framework 自带的 CodeDom 编译器(无需额外包)。
 //
 // 重要约束/风险：
@@ -18,7 +18,7 @@ using System.Reflection;
 using System.Text;
 using Tecnomatix.Engineering;
 
-namespace TxAgent.Ps
+namespace TxTools.Agent.Ps
 {
     public static class CSharpRunner
     {
@@ -44,9 +44,39 @@ namespace TxAgent.Ps
                     var sb = new StringBuilder("编译失败：");
                     sb.AppendLine();
                     foreach (CompilerError err in results.Errors)
+                    {
                         if (!err.IsWarning)
-                            sb.AppendLine("• (" + err.Line + ") " + err.ErrorNumber + ": " + err.ErrorText);
+                        {
+                            int displayLine = err.Line - 8;
+                            if (displayLine <= 0) displayLine = err.Line;
+                            sb.AppendLine("• (" + displayLine + ") " + err.ErrorNumber + ": " + err.ErrorText);
+                        }
+                    }
                     sb.Append("提示：自带编译器是 C# 5 语法(无字符串插值/?./表达式体)。");
+
+                    // 根据CS错误码追加针对性修复提示
+                    var hints = new StringBuilder();
+                    foreach (CompilerError err in results.Errors)
+                    {
+                        if (!err.IsWarning)
+                        {
+                            if (err.ErrorNumber == "CS0126")
+                                hints.AppendLine("• CS0126修复：三元表达式中的null必须显式转型，如 (string)null 或 (object)null");
+                            if (err.ErrorNumber == "CS0021")
+                                hints.AppendLine("• CS0021修复：TxSelection没有索引器，改用 .GetItems()[0]");
+                            if (err.ErrorNumber == "CS1061")
+                                hints.AppendLine("• CS1061修复：该类型没有此方法/属性——先用 inspect_type 验证真实API，不要盲猜");
+                            if (err.ErrorNumber == "CS0104")
+                                hints.AppendLine("• CS0104修复：命名空间冲突——用完整命名空间如 Tecnomatix.Engineering.TxSelection 区分");
+                            if (err.ErrorNumber == "CS1513" || err.ErrorNumber == "CS1022")
+                                hints.AppendLine("• CS1513/CS1022修复：花括号不配对——检查每个 { 是否有对应 }");
+                            if (err.ErrorNumber == "CS0234")
+                                hints.AppendLine("• CS0234修复：命名空间中不存在该类型——用 list_types 搜索正确名称");
+                        }
+                    }
+                    if (hints.Length > 0)
+                        sb.AppendLine().AppendLine("针对性修复提示：").Append(hints);
+
                     error = sb.ToString();
                     return null;
                 }

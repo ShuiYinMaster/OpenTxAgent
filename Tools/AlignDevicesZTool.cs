@@ -1,12 +1,12 @@
-// TxAgent / Tools / AlignDevicesZTool.cs
+// TxTools.Agent / Tools / AlignDevicesZTool.cs
 // 变更示例工具：把选中设备对齐到世界 Z=0。
 // 演示"变更 -> 执行前需用户审批"的模式 (IsReadOnly=false)，且操作本身支持 Ctrl+Z 撤销。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class AlignDevicesZTool : TxAgentToolBase
     {

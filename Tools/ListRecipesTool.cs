@@ -1,11 +1,11 @@
-// TxAgent / Tools / ListRecipesTool.cs
+// TxTools.Agent / Tools / ListRecipesTool.cs
 // 只读：列出已保存的配方，便于 agent 复用而非重复创建。
 
 using System.Text;
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class ListRecipesTool : TxAgentToolBase
     {

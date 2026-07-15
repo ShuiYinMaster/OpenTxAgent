@@ -1,4 +1,4 @@
-// TxAgent / Core / RecipeTool.cs
+// TxTools.Agent / Core / RecipeTool.cs
 // 把一条 Recipe 包装成可调用工具：
 //  - InputSchema 由配方参数生成
 //  - IsReadOnly 按步骤继承：所有步骤都只读 -> 配方只读(免审批)；任一步会改场景 -> 配方需审批
@@ -11,7 +11,7 @@ using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class RecipeTool : ITxAgentTool
     {

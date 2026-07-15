@@ -1,12 +1,12 @@
-// TxAgent / Tools / ActionTools.cs
+// TxTools.Agent / Tools / ActionTools.cs
 // 把信息工具和操作工具串起来的动作原语。
 
 using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     /// <summary>按名称选中场景对象，打通"查到 -> 选中 -> 用基于选择的工具操作"。</summary>
     public sealed class SelectObjectsTool : TxAgentToolBase

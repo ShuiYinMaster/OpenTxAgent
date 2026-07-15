@@ -1,11 +1,11 @@
-// TxAgent / Tools / UpdatePlanTool.cs
+// TxTools.Agent / Tools / UpdatePlanTool.cs
 // 让 agent 记录/更新任务计划。复杂多步任务时先列计划，再随进度勾选。
 
 using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class UpdatePlanTool : TxAgentToolBase
     {

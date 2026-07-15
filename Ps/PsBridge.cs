@@ -1,8 +1,8 @@
-// TxAgent / Ps / PsBridge.cs
+// TxTools.Agent / Ps / PsBridge.cs
 // PS 场景访问门面：所有工具对 Tecnomatix.Engineering / PsReader 的调用都收敛到这里。
 // 套路：dynamic + try/catch 兜 SDK 版本差异；经 PsContext.Current.Run(...) 路由回 PS 主线程。
 //
-// 依赖：引用 MyPlugin.ExportGun.PsReader / OperationInfo / PointType 等(仅本文件)。
+// 依赖：引用 TxTools.ExportGun.PsReader / OperationInfo / PointType 等(仅本文件)。
 // 物理树遍历照搬 PsReader.EnumDisplayableObjects 的健壮策略：
 //   PhysicalRoot/ComponentRoot/ResourceRoot + GetAllDescendants(TxTypeFilter) + 无参回退。
 
@@ -14,14 +14,21 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Tecnomatix.Engineering;
-using TxAgent.Core;
-using MyPlugin.ExportGun;   // PsReader, OperationInfo, PointType, TcpOption ...
+using TxTools.Agent.Core;
+using TxTools.ExportGun;
+using RobotBaseResult = TxTools.RobotBaseChecker.RobotBaseResult;
+using RobotBaseReader = TxTools.RobotBaseChecker.RobotBaseReader;
+using BrandMode = TxTools.RobotBaseChecker.BrandMode;
+using RobotKinematics = TxTools.RobotBaseChecker.RobotKinematics;
 
-namespace TxAgent.Ps
+namespace TxTools.Agent.Ps
 {
     public static class PsBridge
     {
         private static readonly Action<string> Nolog = delegate (string s) { };
+
+        // 仿真播放器引用（供 simulate_operation 的 stop/pause/rewind 后续控制）
+        private static dynamic _lastSimPlayer;
 
         // ───────── 基础查询 ─────────
 
@@ -610,6 +617,583 @@ namespace TxAgent.Ps
             });
         }
 
+        // ───────── 新增：机器人基座校验 ─────────
+
+        /// <summary>校验场景内所有机器人 BASE0 是否与期望一致。只读。</summary>
+        public static string CheckRobotBase(double posTolMm, double rotTol, string brandMode)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                var doc = TxApplication.ActiveDocument;
+                if (doc == null) return "没有打开的研究文档。";
+
+                // 字符串 → BrandMode 枚举（同 assembly，internal 可直访）
+                BrandMode mode;
+                if (string.Equals(brandMode, "Fanuc", StringComparison.OrdinalIgnoreCase)) mode = BrandMode.Fanuc;
+                else if (string.Equals(brandMode, "Generic", StringComparison.OrdinalIgnoreCase)) mode = BrandMode.Generic;
+                else mode = BrandMode.Auto;
+
+                try
+                {
+                    var results = RobotBaseReader.Analyze(posTolMm, rotTol, mode);
+                    if (results == null || results.Count == 0) return "场景中没有找到机器人。";
+
+                    var sb = new StringBuilder();
+                    sb.AppendLine("机器人 BASE0 校验结果（容差: 位置 " + posTolMm + "mm / 旋转 " + rotTol + "）：");
+                    sb.AppendLine();
+
+                    int pass = 0, fail = 0;
+                    foreach (var r in results)
+                    {
+                        var verdict = r.Verdict ?? "";
+                        if (verdict.Contains("一致")) pass++; else fail++;
+                        sb.AppendLine("• " + r.RobotName + "  品牌=" + (r.Brand ?? "?")
+                            + "  ΔPos=" + (r.DeltaPos >= 0 ? r.DeltaPos.ToString("F3") : "—") + "mm"
+                            + "  ΔRot=" + (r.DeltaRot >= 0 ? r.DeltaRot.ToString("F4") : "—")
+                            + "  → " + verdict);
+                    }
+                    sb.AppendLine();
+                    sb.Append("汇总: " + pass + " 一致, " + fail + " 存在偏差 / 共 " + results.Count + " 台机器人");
+                    return sb.ToString();
+                }
+                catch (Exception ex) { return "校验异常: " + ex.Message; }
+            });
+        }
+
+        // ───────── 新增：对象位置查询 ─────────
+
+        /// <summary>查询对象的世界坐标系位置和姿态。只读。</summary>
+        public static string GetObjectLocation(string name, string format)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                ITxObject obj;
+                if (!string.IsNullOrWhiteSpace(name))
+                    obj = FindByName(name);
+                else
+                    obj = FirstSelected();
+
+                if (obj == null) return "找不到对象" + (string.IsNullOrWhiteSpace(name) ? "（当前没有选中）" : " '" + name + "'。");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("对象: " + SafeName(obj));
+                sb.AppendLine("类型: " + obj.GetType().Name);
+
+                try
+                {
+                    TxTransformation tx = null;
+                    try { if (obj is ITxLocatableObject loc) tx = loc.AbsoluteLocation; } catch { }
+                    if (tx == null) try { dynamic d = obj; tx = d.AbsoluteLocation; } catch { }
+                    if (tx == null) { sb.AppendLine("无 AbsoluteLocation 信息。"); return sb.ToString(); }
+
+                    // XYZ 平移
+                    double x = 0, y = 0, z = 0;
+                    try { dynamic t = tx.Translation; x = (double)t.X; y = (double)t.Y; z = (double)t.Z; }
+                    catch { try { x = (double)((dynamic)tx)[0, 3]; y = (double)((dynamic)tx)[1, 3]; z = (double)((dynamic)tx)[2, 3]; } catch { } }
+                    sb.AppendLine("位置(mm): X=" + x.ToString("F3") + "  Y=" + y.ToString("F3") + "  Z=" + z.ToString("F3"));
+
+                    // 姿态
+                    if (string.Equals(format, "matrix", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            // SDK 不同版本旋转矩阵属性名不同，多策略反射
+                            dynamic rm = InvokeOrGet(tx, "RotationMatrix") ?? InvokeOrGet(tx, "GetRotationMatrix");
+                            sb.AppendLine("旋转矩阵:");
+                            for (int i = 0; i < 3; i++)
+                            {
+                                sb.Append("  [");
+                                for (int j = 0; j < 3; j++)
+                                    sb.Append(((double)rm[i, j]).ToString("F6") + (j < 2 ? ", " : ""));
+                                sb.AppendLine("]");
+                            }
+                        }
+                        catch { sb.AppendLine("(旋转矩阵不可读)"); }
+                    }
+                    else
+                    {
+                        // rpy / euler — SDK 不同版本属性名不同，多策略反射
+                        string label = string.Equals(format, "euler", StringComparison.OrdinalIgnoreCase) ? "Euler" : "RPY";
+                        try
+                        {
+                            // 依次尝试 RotationRPY_ZYX / RotationRPY / GetRotationRPY（与 RobotBaseReader 同策略）
+                            dynamic rp = InvokeOrGet(tx, "RotationRPY_ZYX")
+                                         ?? InvokeOrGet(tx, "RotationRPY")
+                                         ?? InvokeOrGet(tx, "GetRotationRPY");
+                            sb.AppendLine("姿态(" + label + ",度): RX=" + ((double)rp.X).ToString("F4")
+                                + "  RY=" + ((double)rp.Y).ToString("F4")
+                                + "  RZ=" + ((double)rp.Z).ToString("F4"));
+                        }
+                        catch { sb.AppendLine("(" + label + " 角不可读)"); }
+                    }
+                    return sb.ToString();
+                }
+                catch (Exception ex) { return "读取位置异常: " + ex.Message; }
+            });
+        }
+
+        // ───────── 新增：机器人运动学信息 ─────────
+
+        /// <summary>查询机器人关节数、名称、当前角度、TCP 数量。只读。</summary>
+        public static string InspectRobotKinematics(string name)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                TxRobot robot = null;
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    // 精确优先 → 模糊
+                    foreach (var o in CollectScene(true))
+                        if (o is TxRobot && string.Equals(SafeName(o), name, StringComparison.Ordinal))
+                        { robot = (TxRobot)o; break; }
+                    if (robot == null)
+                        foreach (var o in CollectScene(true))
+                            if (o is TxRobot && SafeName(o).IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
+                            { robot = (TxRobot)o; break; }
+                }
+                else
+                {
+                    var sel = FirstSelected();
+                    if (sel is TxRobot) robot = (TxRobot)sel;
+                    else foreach (var o in CollectScene(true)) if (o is TxRobot) { robot = (TxRobot)o; break; }
+                }
+
+                if (robot == null) return "找不到机器人" + (string.IsNullOrWhiteSpace(name) ? "（场景中没有机器人）" : " '" + name + "'。");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("机器人: " + SafeName(robot));
+
+                try
+                {
+                    dynamic d = robot;
+                    int jointCount = 0;
+                    try { jointCount = (int)d.JointCount; } catch { }
+                    sb.AppendLine("关节数: " + jointCount);
+
+                    // 逐关节信息
+                    try
+                    {
+                        dynamic joints = d.Joints;
+                        var en = joints as IEnumerable;
+                        if (en != null)
+                        {
+                            int idx = 0;
+                            foreach (var j in en)
+                            {
+                                try
+                                {
+                                    dynamic dj = j;
+                                    string jName = (string)dj.Name ?? ("J" + idx);
+                                    double jVal = 0;
+                                    try { jVal = (double)dj.CurrentValue; } catch { }
+                                    sb.AppendLine("  J" + idx + ": " + jName + " = " + jVal.ToString("F3") + "°");
+                                    idx++;
+                                }
+                                catch { idx++; }
+                            }
+                        }
+                    }
+                    catch { sb.AppendLine("(关节信息不可读)"); }
+
+                    // TCP 数量
+                    try
+                    {
+                        int tcpCount = 0;
+                        dynamic tcpData = d.TCPData;
+                        if (tcpData != null)
+                        {
+                            var tcpEn = tcpData as IEnumerable;
+                            if (tcpEn != null) foreach (var t in tcpEn) tcpCount++;
+                            else tcpCount = 1;
+                        }
+                        sb.AppendLine("TCP 数量: " + tcpCount);
+                    }
+                    catch { sb.AppendLine("(TCP 信息不可读)"); }
+
+                    // 品牌（尝试读控制器类型）
+                    try
+                    {
+                        dynamic ctrl = d.ControllerType;
+                        if (ctrl != null) sb.AppendLine("控制器: " + ctrl.ToString());
+                    }
+                    catch { }
+
+                    return sb.ToString();
+                }
+                catch (Exception ex) { return "查询运动学异常: " + ex.Message; }
+            });
+        }
+
+        // ───────── 新增：查找操作绑定机器人 ─────────
+
+        /// <summary>在操作树中查找操作绑定的机器人。只读。</summary>
+        public static string FindRobotForOperation(string keyword)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                var ops = CollectOperations();
+                if (ops.Count == 0) return "操作树中没有找到操作。";
+
+                var sb = new StringBuilder();
+                int found = 0;
+
+                foreach (ITxObject op in ops)
+                {
+                    string opName = SafeName(op);
+                    if (!string.IsNullOrWhiteSpace(keyword)
+                        && opName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    string robotName = "";
+                    try
+                    {
+                        dynamic dOp = op;
+                        dynamic robot = dOp.Robot;
+                        if (robot != null) robotName = SafeName(robot);
+                    }
+                    catch { }
+                    // 也尝试用 FindRobotForOps
+                    if (robotName.Length == 0)
+                    {
+                        try
+                        {
+                            TxRobot r = FindRobotForOps(op, null);
+                            if (r != null) robotName = SafeName(r);
+                        }
+                        catch { }
+                    }
+
+                    if (robotName.Length > 0)
+                    {
+                        sb.AppendLine("• " + opName + " → " + robotName);
+                        found++;
+                    }
+                    else if (string.IsNullOrWhiteSpace(keyword))
+                    {
+                        sb.AppendLine("• " + opName + " → (无机器人绑定)");
+                        found++;
+                    }
+                }
+
+                if (found == 0) sb.AppendLine("没有找到匹配的操作或绑定关系。");
+                else sb.AppendLine().Append("共 " + found + " 条映射");
+                return sb.ToString();
+            });
+        }
+
+        // ───────── 新增：扫描设备 Z 向状态（只读）─────────
+
+        /// <summary>扫描场景中所有设备的 Z 向落地状态。只读，不做任何修改。</summary>
+        public static string ScanDevicesZ(string[] extraIgnoreKeywords)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                var doc = TxApplication.ActiveDocument;
+                if (doc == null) return "没有打开的研究文档。";
+
+                var skipNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "gun", "robot", "tool", "gripper", "conveyor", "weldgun", "flange", "human" };
+                var skipTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "TxWeldGun", "TxGun", "TxGripper", "TxTool", "TxRobot", "TxHumanModel", "TxConveyor", "TxSimulationPlayer" };
+                if (extraIgnoreKeywords != null)
+                    foreach (var k in extraIgnoreKeywords)
+                    { skipNames.Add(k.Trim()); skipTypes.Add(k.Trim()); }
+
+                var sb = new StringBuilder();
+                sb.AppendLine("设备 Z 向状态扫描（只读）：");
+                sb.AppendLine();
+
+                int checkedCount = 0, needAlign = 0, alreadyOk = 0, skipped = 0;
+
+                foreach (var obj in CollectScene(true))
+                {
+                    string typeName = obj.GetType().Name;
+                    string objName = SafeName(obj);
+
+                    // 跳过已知非落地类型
+                    bool shouldSkip = false;
+                    foreach (var st in skipTypes)
+                        if (typeName.IndexOf(st, StringComparison.OrdinalIgnoreCase) >= 0) { shouldSkip = true; break; }
+                    if (!shouldSkip)
+                        foreach (var sn in skipNames)
+                            if (objName.IndexOf(sn, StringComparison.OrdinalIgnoreCase) >= 0) { shouldSkip = true; break; }
+
+                    // 也检查接口和父级（复刻 DeviceZAlignService.CheckShouldSkip 的策略）
+                    if (!shouldSkip)
+                    {
+                        try
+                        {
+                            foreach (var iface in obj.GetType().GetInterfaces())
+                                if (iface.Name.Contains("Gun") || iface.Name.Contains("Gripper")
+                                    || iface.Name.Contains("Robot") || iface.Name.Contains("Tool"))
+                                { shouldSkip = true; break; }
+                        }
+                        catch { }
+                    }
+                    if (!shouldSkip)
+                    {
+                        try
+                        {
+                            dynamic dobj = obj;
+                            dynamic parent = dobj.Parent;
+                            if (parent != null)
+                            {
+                                string pt = parent.GetType().Name;
+                                if (pt.Contains("Robot") || pt.Contains("Flange")) shouldSkip = true;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (shouldSkip) { skipped++; continue; }
+
+                    // 获取位置
+                    TxTransformation absTx = null;
+                    try { if (obj is ITxLocatableObject loc) absTx = loc.AbsoluteLocation; } catch { }
+                    if (absTx == null) try { dynamic d = obj; absTx = d.AbsoluteLocation; } catch { }
+                    if (absTx == null) continue;
+
+                    // 读取 Z
+                    double currentZ = 0;
+                    try { dynamic t = absTx.Translation; currentZ = (double)t.Z; }
+                    catch { try { currentZ = (double)((dynamic)absTx)[2, 3]; } catch { } }
+
+                    // 尝试读 BoundingBox 获取最低 Z
+                    double lowestZ = currentZ; // 回退：原点 Z
+                    string zSource = "原点";
+                    try
+                    {
+                        dynamic d = obj;
+                        dynamic bbox = d.BoundingBox;
+                        if (bbox != null)
+                        {
+                            try { lowestZ = (double)bbox.MinZ; zSource = "BoundingBox"; } catch { }
+                        }
+                    }
+                    catch { }
+                    // 尝试轴交点（同 DeviceZAlignService.GetDeviceMinZ）
+                    try
+                    {
+                        if (obj is TxComponent comp)
+                        {
+                            dynamic dComp = comp;
+                            object pts = null;
+                            try { pts = dComp.GetLocationAxisIntersectionPoints(2); } catch { }
+                            if (pts == null) try { pts = dComp.GetLocationAxisIntersectionPoints(); } catch { }
+                            if (pts != null)
+                            {
+                                double minZPts = double.MaxValue;
+                                var en = pts as IEnumerable;
+                                if (en != null) foreach (object pt in en)
+                                {
+                                    try { dynamic dp = pt; double pz = Convert.ToDouble(dp.Z); if (pz < minZPts) minZPts = pz; } catch { }
+                                    try { dynamic dp = pt; double pz = Convert.ToDouble(dp[2, 3]); if (pz < minZPts) minZPts = pz; } catch { }
+                                }
+                                if (minZPts < double.MaxValue) { lowestZ = minZPts; zSource = "轴交点"; }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    checkedCount++;
+                    if (Math.Abs(lowestZ) < 1.0) // 1mm 容差认为已落地
+                    {
+                        alreadyOk++;
+                        sb.AppendLine("  ✓ " + objName + " (" + typeName + ")  Z=" + currentZ.ToString("F3")
+                            + "  最低Z=" + lowestZ.ToString("F3") + "[" + zSource + "]  已落地");
+                    }
+                    else
+                    {
+                        needAlign++;
+                        sb.AppendLine("  ✗ " + objName + " (" + typeName + ")  Z=" + currentZ.ToString("F3")
+                            + "  最低Z=" + lowestZ.ToString("F3") + "[" + zSource + "]"
+                            + "  需偏移 " + (-lowestZ).ToString("F3") + "mm");
+                    }
+                }
+
+                sb.AppendLine();
+                sb.Append("汇总: 检查 " + checkedCount + " 台, " + alreadyOk + " 已落地, "
+                    + needAlign + " 需对齐, " + skipped + " 被跳过");
+                return sb.ToString();
+            });
+        }
+
+        // ───────── 新增：设置对象位置（变更）─────────
+
+        /// <summary>设置对象的世界坐标系位置（含可选姿态）。变更操作，包在 Undo 块里可撤销。</summary>
+        public static string SetObjectLocation(string name, double x, double y, double z, double? rx, double? ry, double? rz)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                ITxObject obj = FindByName(name);
+                if (obj == null) return "找不到对象 '" + name + "'。";
+
+                var doc = TxApplication.ActiveDocument;
+                if (doc == null) return "没有打开的研究文档。";
+
+                bool undo = BeginUndo(doc, "set_object_location(" + name + ")");
+                try
+                {
+                    // 获取当前变换
+                    TxTransformation curTx = null;
+                    try { if (obj is ITxLocatableObject loc) curTx = loc.AbsoluteLocation; } catch { }
+                    if (curTx == null) try { dynamic d = obj; curTx = d.AbsoluteLocation; } catch { }
+                    if (curTx == null) return "无法获取 " + SafeName(obj) + " 的 AbsoluteLocation。";
+
+                    // 读取旧位置（供报告）
+                    double oldX = 0, oldY = 0, oldZ = 0;
+                    try { dynamic t = curTx.Translation; oldX = (double)t.X; oldY = (double)t.Y; oldZ = (double)t.Z; }
+                    catch { try { oldX = (double)((dynamic)curTx)[0, 3]; oldY = (double)((dynamic)curTx)[1, 3]; oldZ = (double)((dynamic)curTx)[2, 3]; } catch { } }
+
+                    // 修改平移
+                    bool written = false;
+                    try { dynamic d = curTx; d.Translation = new TxVector(x, y, z); written = true; } catch { }
+                    if (!written) try { dynamic d = curTx; d[0, 3] = x; d[1, 3] = y; d[2, 3] = z; written = true; } catch { }
+
+                    // 修改姿态（仅当指定了 rx/ry/rz）
+                    if (rx.HasValue || ry.HasValue || rz.HasValue)
+                    {
+                        // 读取旧 RPY — 多策略反射（与 RobotBaseReader 同策略）
+                        double oldRx = 0, oldRy = 0, oldRz = 0;
+                        try
+                        {
+                            dynamic rp = InvokeOrGet(curTx, "RotationRPY_ZYX")
+                                         ?? InvokeOrGet(curTx, "RotationRPY")
+                                         ?? InvokeOrGet(curTx, "GetRotationRPY");
+                            oldRx = (double)rp.X; oldRy = (double)rp.Y; oldRz = (double)rp.Z;
+                        }
+                        catch { }
+
+                        double finalRx = rx ?? oldRx;
+                        double finalRy = ry ?? oldRy;
+                        double finalRz = rz ?? oldRz;
+
+                        // 尝试设置旋转
+                        try { dynamic d = curTx; d.SetRotationRPY(finalRx, finalRy, finalRz); written = true; }
+                        catch { try { dynamic d = curTx; d.RotationRPY = new TxVector(finalRx, finalRy, finalRz); } catch { } }
+                    }
+
+                    // 写回对象
+                    bool applied = false;
+                    try { if (obj is ITxLocatableObject loc) { loc.AbsoluteLocation = curTx; applied = true; } } catch { }
+                    if (!applied) try { dynamic d = obj; d.AbsoluteLocation = curTx; applied = true; } catch { }
+                    if (!applied) try { dynamic d = obj; d.Location = curTx; applied = true; } catch { }
+                    if (!applied) try { dynamic d = obj; d.SetAbsoluteLocation(curTx); applied = true; } catch { }
+
+                    if (!applied) return "设置位置失败：无法写入 AbsoluteLocation 到 " + SafeName(obj) + "。";
+
+                    try { TxApplication.RefreshDisplay(); } catch { }
+
+                    var sb = new StringBuilder();
+                    sb.AppendLine(SafeName(obj) + " 位置已更新:");
+                    sb.AppendLine("  旧: X=" + oldX.ToString("F3") + "  Y=" + oldY.ToString("F3") + "  Z=" + oldZ.ToString("F3"));
+                    sb.Append("  新: X=" + x.ToString("F3") + "  Y=" + y.ToString("F3") + "  Z=" + z.ToString("F3"));
+                    if (rx.HasValue) sb.Append("  RX=" + rx.Value.ToString("F4"));
+                    if (ry.HasValue) sb.Append("  RY=" + ry.Value.ToString("F4"));
+                    if (rz.HasValue) sb.Append("  RZ=" + rz.Value.ToString("F4"));
+                    if (undo) sb.Append("\n可 Ctrl+Z 撤销");
+                    return sb.ToString();
+                }
+                finally { if (undo) EndUndo(doc); }
+            });
+        }
+
+        // ───────── 新增：播放/重置仿真（变更）─────────
+
+        /// <summary>播放/暂停/停止/倒带操作仿真。变更操作，需审批。</summary>
+        public static string SimulateOperation(string operationName, string action)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                // 查找操作
+                ITxObject opObj = null;
+                if (!string.IsNullOrWhiteSpace(operationName))
+                {
+                    var ops = CollectOperations();
+                    // 精确匹配
+                    foreach (var o in ops)
+                        if (string.Equals(SafeName(o), operationName, StringComparison.Ordinal))
+                        { opObj = o; break; }
+                    // 模糊匹配
+                    if (opObj == null)
+                        foreach (var o in ops)
+                            if (SafeName(o).IndexOf(operationName, StringComparison.OrdinalIgnoreCase) >= 0)
+                            { opObj = o; break; }
+                }
+                else
+                {
+                    opObj = FirstSelected();
+                    if (opObj != null)
+                    {
+                        // 确认选中的是操作类型
+                        bool isOp = false;
+                        try { dynamic d = opObj; isOp = d.GetType().Name.Contains("Operation"); } catch { }
+                        if (!isOp) opObj = null;
+                    }
+                }
+
+                if (opObj == null) return "找不到操作" + (string.IsNullOrWhiteSpace(operationName) ? "（当前没有选中操作）" : " '" + operationName + "'。");
+
+                try
+                {
+                    dynamic player = _lastSimPlayer;
+                    bool reusePlayer = false;
+
+                    // 判断能否复用已有 player（操作相同）
+                    if (player != null)
+                    {
+                        try
+                        {
+                            dynamic curOp = player.Operation;
+                            if (curOp != null && string.Equals(SafeName(curOp), SafeName(opObj), StringComparison.Ordinal))
+                                reusePlayer = true;
+                        }
+                        catch { }
+                    }
+
+                    if (!reusePlayer)
+                    {
+                        player = new TxSimulationPlayer();
+                        try { player.SetOperation((dynamic)opObj); } catch { }
+                        _lastSimPlayer = player;
+                    }
+
+                    string resultMsg;
+                    switch (action)
+                    {
+                        case "play":
+                            player.Rewind();
+                            player.Play();
+                            resultMsg = "仿真已开始播放";
+                            break;
+                        case "pause":
+                            try { player.Pause(); resultMsg = "仿真已暂停"; }
+                            catch { resultMsg = "暂停不可用（仿真可能未在播放中）"; }
+                            break;
+                        case "stop":
+                            try { player.Stop(); resultMsg = "仿真已停止"; }
+                            catch
+                            {
+                                try { player.Pause(); resultMsg = "仿真已暂停(stop回退为pause)"; }
+                                catch { resultMsg = "停止/暂停均不可用"; }
+                            }
+                            break;
+                        case "rewind":
+                            player.Rewind();
+                            resultMsg = "仿真已倒带到起点";
+                            break;
+                        default:
+                            player.Rewind();
+                            player.Play();
+                            resultMsg = "仿真已开始播放(默认)";
+                            break;
+                    }
+
+                    return resultMsg + ": " + SafeName(opObj) + "  类型: " + opObj.GetType().Name;
+                }
+                catch (Exception ex) { return "仿真操作异常: " + ex.Message; }
+            });
+        }
+
         private static bool BeginUndo(TxDocument doc, string desc)
         {
             try { dynamic d = doc; dynamic ur = d.UndoRedo; if (ur != null) { ur.BeginCommand(desc); return true; } } catch { }
@@ -760,6 +1344,88 @@ namespace TxAgent.Ps
                 return string.IsNullOrEmpty(n) ? o.ToString() : n;
             }
             catch { return o == null ? "<null>" : o.ToString(); }
+        }
+
+        // ───────── 可复用私有辅助方法 ─────────
+
+        /// <summary>字符串 → BrandMode 枚举转换。可复用工具。</summary>
+        private static BrandMode ParseBrandMode(string s)
+        {
+            if (string.Equals(s, "Fanuc", StringComparison.OrdinalIgnoreCase)) return BrandMode.Fanuc;
+            if (string.Equals(s, "Generic", StringComparison.OrdinalIgnoreCase)) return BrandMode.Generic;
+            return BrandMode.Auto;
+        }
+
+        private static double ExtractZFromTx(TxTransformation tx)
+        {
+            try { dynamic d = tx; return Convert.ToDouble(d[2, 3]); } catch { }
+            try { dynamic d = tx; return Convert.ToDouble(d.Translation.Z); } catch { }
+            try { dynamic d = tx; return Convert.ToDouble(d.Z); } catch { }
+            try { dynamic d = tx; var v = d.TranslationVector; return Convert.ToDouble(v.Z); } catch { }
+            return 0;
+        }
+
+        private static double GetDeviceMinZScan(ITxObject obj, TxTransformation absTx, out string method)
+        {
+            method = "原点";
+            try
+            {
+                if (obj is TxComponent comp)
+                {
+                    dynamic dComp = comp;
+                    try { dynamic pts = dComp.GetLocationAxisIntersectionPoints(2); double m = ExtractMinZFromPtsScan(pts); if (m < double.MaxValue) { method = "轴交点"; return m; } } catch { }
+                    try { dynamic pts = dComp.GetLocationAxisIntersectionPoints(); double m = ExtractMinZFromPtsScan(pts); if (m < double.MaxValue) { method = "轴交点"; return m; } } catch { }
+                }
+            }
+            catch { }
+            return ExtractZFromTx(absTx);
+        }
+
+        private static double ExtractMinZFromPtsScan(object points)
+        {
+            double minZ = double.MaxValue;
+            if (points == null) return minZ;
+            try
+            {
+                var en = points as IEnumerable;
+                if (en != null) { foreach (object pt in en) { double z = ExtractZFromPtScan(pt); if (z < minZ) minZ = z; } return minZ; }
+            }
+            catch { }
+            double s = ExtractZFromPtScan(points);
+            if (s < minZ) minZ = s;
+            return minZ;
+        }
+
+        private static double ExtractZFromPtScan(object pt)
+        {
+            if (pt == null) return double.MaxValue;
+            try { dynamic d = pt; return Convert.ToDouble(d.Z); } catch { }
+            try { dynamic d = pt; return Convert.ToDouble(d[2, 3]); } catch { }
+            try { dynamic d = pt; return Convert.ToDouble(d.Translation.Z); } catch { }
+            return double.MaxValue;
+        }
+
+        // ───────── 位置辅助（复用 DeviceZAlignService 同款多策略） ─────────
+
+        private static TxTransformation GetAbsoluteLocation(ITxObject obj)
+        {
+            try { if (obj is ITxLocatableObject loc) { var tx = loc.AbsoluteLocation; if (tx != null) return tx; } } catch { }
+            try { dynamic d = obj; var tx = d.AbsoluteLocation as TxTransformation; if (tx != null) return tx; } catch { }
+            try { dynamic d = obj; var tx = d.Location as TxTransformation; if (tx != null) return tx; } catch { }
+            try { dynamic d = obj; var tx = d.AbsoluteFrame as TxTransformation; if (tx != null) return tx; } catch { }
+            try { dynamic d = obj; var tx = d.LocationInWorld as TxTransformation; if (tx != null) return tx; } catch { }
+            return null;
+        }
+
+        private static object InvokeOrGet(object obj, string name)
+        {
+            if (obj == null) return null;
+            var t = obj.GetType();
+            var pi = t.GetProperty(name);
+            if (pi != null) return pi.GetValue(obj, null);
+            var mi = t.GetMethod(name, Type.EmptyTypes);
+            if (mi != null) return mi.Invoke(obj, null);
+            return null;
         }
     }
 }

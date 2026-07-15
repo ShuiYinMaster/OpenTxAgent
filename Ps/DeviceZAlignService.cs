@@ -1,4 +1,4 @@
-// TxAgent / Ps / DeviceZAlignService.cs
+// TxTools.Agent / Ps / DeviceZAlignService.cs
 // 无界面的设备 Z 向落地对齐，忠实复刻 DeviceZAligner 的多策略实现，作用于"当前选中"。
 // 与 select_objects 配合：先选中要对齐的设备，再调 align_devices_z。
 // 全程包在 Undo 块里 -> 对齐后可 Ctrl+Z 撤销。
@@ -10,7 +10,7 @@ using System.Collections;
 using System.Collections.Generic;
 using Tecnomatix.Engineering;
 
-namespace TxAgent.Ps
+namespace TxTools.Agent.Ps
 {
     public static class DeviceZAlignService
     {

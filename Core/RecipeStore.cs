@@ -1,6 +1,6 @@
-// TxAgent / Core / RecipeStore.cs
+// TxTools.Agent / Core / RecipeStore.cs
 // 配方持久化。明文 JSON 存到插件文件夹下的 recipes.json (配方非机密，不需加密)。
-// 路径策略与 KeyStore 一致：插件目录优先，不可写则回退 %LOCALAPPDATA%\TxAgent。
+// 路径策略与 KeyStore 一致：插件目录优先，不可写则回退 %LOCALAPPDATA%\TxTools.Agent。
 
 using System;
 using System.Collections.Generic;
@@ -9,7 +9,7 @@ using System.Reflection;
 using System.Text;
 using Newtonsoft.Json;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public static class RecipeStore
     {
@@ -78,7 +78,7 @@ namespace TxAgent.Core
             catch { }
 
             var localDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxAgent");
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent");
 
             if (string.IsNullOrEmpty(pluginDir))
                 return new[] { Path.Combine(localDir, FileName) };

@@ -1,10 +1,10 @@
-// TxAgent / Tools / DeleteRecipeTool.cs
+// TxTools.Agent / Tools / DeleteRecipeTool.cs
 // 删除一条已保存的配方(注册表 + 磁盘)。内置原语不可删。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class DeleteRecipeTool : ITxAgentTool
     {

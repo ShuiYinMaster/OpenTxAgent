@@ -1,4 +1,4 @@
-// TxAgent / UI / ApiKeyDialog.cs
+// TxTools.Agent / UI / ApiKeyDialog.cs
 // 输入 DeepSeek API Key 的模态弹窗。默认掩码，可勾选临时显示明文。
 // 确定后由调用方 (TxAgentForm) 负责加密落盘。
 
@@ -12,7 +12,7 @@ using Button = System.Windows.Forms.Button;
 using Label = System.Windows.Forms.Label;
 using CheckBox = System.Windows.Forms.CheckBox;
 
-namespace TxAgent.UI
+namespace TxTools.Agent.UI
 {
     public sealed class ApiKeyDialog : Form
     {

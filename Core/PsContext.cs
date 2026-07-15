@@ -1,4 +1,4 @@
-// TxAgent / Core / PsContext.cs
+// TxTools.Agent / Core / PsContext.cs
 // 把对 Tecnomatix.Engineering 的调用同步路由回 PS 主线程。
 // 抽自你 ExportService 的 OnPs(psCtx.Send) 套路——比依赖 async/await 续延更稳：
 // 即使某个工具在后台线程被调用，PS API 仍在主线程执行。
@@ -7,7 +7,7 @@
 using System;
 using System.Threading;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class PsContext
     {

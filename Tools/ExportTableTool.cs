@@ -1,4 +1,4 @@
-// TxAgent / Tools / ExportTableTool.cs
+// TxTools.Agent / Tools / ExportTableTool.cs
 // 把 agent 汇总好的表格数据导出为 .xlsx。配合 list_operations / count_objects /
 // list_children / count_points 等信息工具：先汇总，再用本工具落地成 Excel。
 
@@ -7,9 +7,9 @@ using System.Collections.Generic;
 using System.IO;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
+using TxTools.Agent.Core;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class ExportTableTool : TxAgentToolBase
     {

@@ -1,4 +1,4 @@
-// TxAgent / Core / ConversationStore.cs
+// TxTools.Agent / Core / ConversationStore.cs
 // 多对话持久化：每个对话存成 conversations/{id}.json，含标题/时间/消息。
 // 像常见 AI 工具那样——“新对话”不再清空旧对话，而是开一条新的，旧对话保留可回看。
 // 兼容：若检测到旧版单文件 conversation.json，首次访问时迁移成一条对话。
@@ -12,7 +12,7 @@ using System.Reflection;
 using System.Text;
 using Newtonsoft.Json;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class ConversationMeta
     {
@@ -162,7 +162,7 @@ namespace TxAgent.Core
                 try { Directory.CreateDirectory(d); return d; } catch { }
             }
             return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxAgent", FolderName);
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent", FolderName);
         }
 
         private static string[] LegacyPaths()
@@ -175,7 +175,7 @@ namespace TxAgent.Core
             }
             catch { }
             list.Add(Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxAgent", LegacyFile));
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent", LegacyFile));
             return list.ToArray();
         }
 

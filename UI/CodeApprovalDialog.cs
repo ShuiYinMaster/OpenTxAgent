@@ -1,4 +1,4 @@
-// TxAgent / UI / CodeApprovalDialog.cs
+// TxTools.Agent / UI / CodeApprovalDialog.cs
 // 代码类操作(run_csharp)的审批框：用可滚动的只读文本框展示完整代码，
 // 窗口尺寸固定且 clamp 到屏幕工作区，长代码不再顶穿屏幕。MessageBox 会按内容撑大且不可滚动，故不适用。
 
@@ -11,7 +11,7 @@ using TextBox = System.Windows.Forms.TextBox;
 using Button = System.Windows.Forms.Button;
 using Label = System.Windows.Forms.Label;
 
-namespace TxAgent.UI
+namespace TxTools.Agent.UI
 {
     public sealed class CodeApprovalDialog : Form
     {

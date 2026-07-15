@@ -1,4 +1,4 @@
-// TxAgent / Core / DeepSeekClient.cs
+// TxTools.Agent / Core / DeepSeekClient.cs
 // 直连 https://api.deepseek.com/chat/completions 的薄客户端 (OpenAI 兼容)。
 // 网络要求: PS 工作站需放行到 api.deepseek.com 的出站 HTTPS。
 
@@ -14,7 +14,7 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class DeepSeekClient
     {
@@ -66,8 +66,10 @@ namespace TxAgent.Core
             }
         }
 
-        /// <summary>流式发送：边收边回调文本分片，结束后返回拼装好的 assistant 消息(含 tool_calls)。</summary>
-        public async Task<ChatMessage> SendStreamAsync(ChatRequest request, Action<string> onTextDelta, CancellationToken ct)
+        /// <summary>流式发送：边收边回调文本分片，结束后返回拼装好的 assistant 消息(含 tool_calls)。
+        /// 最后一个 SSE 包中的 usage 字段会写入 outUsage（如不为 null）。</summary>
+        public async Task<ChatMessage> SendStreamAsync(ChatRequest request, Action<string> onTextDelta,
+            CancellationToken ct, Action<TokenUsage> onUsage = null)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
             request.Stream = true;
@@ -88,6 +90,7 @@ namespace TxAgent.Core
 
                     var content = new StringBuilder();
                     var toolAcc = new SortedDictionary<int, ToolCallAcc>();
+                    TokenUsage lastUsage = null;
 
                     using (var stream = await resp.Content.ReadAsStreamAsync())
                     using (var reader = new StreamReader(stream, Encoding.UTF8))
@@ -103,6 +106,13 @@ namespace TxAgent.Core
 
                             JObject chunk;
                             try { chunk = JObject.Parse(data); } catch { continue; }
+
+                            // 顶层 usage（DeepSeek 在末尾 chunk 带回）
+                            var usageTok = chunk["usage"];
+                            if (usageTok != null && usageTok.Type == JTokenType.Object)
+                            {
+                                try { lastUsage = usageTok.ToObject<TokenUsage>(); } catch { }
+                            }
 
                             var choices = chunk["choices"] as JArray;
                             if (choices == null || choices.Count == 0) continue;
@@ -133,6 +143,9 @@ namespace TxAgent.Core
                                 }
                         }
                     }
+
+                    // 回调 usage
+                    if (lastUsage != null && onUsage != null) onUsage(lastUsage);
 
                     var message = new ChatMessage("assistant", content.Length > 0 ? content.ToString() : null);
                     if (toolAcc.Count > 0)

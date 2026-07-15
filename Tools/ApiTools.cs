@@ -1,11 +1,11 @@
-// TxAgent / Tools / ApiTools.cs
+// TxTools.Agent / Tools / ApiTools.cs
 // 让 AI 从内部读懂 PS SDK 的真实 API（反射），为 run_csharp 写代码打底。都是只读。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     public sealed class ListTypesTool : TxAgentToolBase
     {

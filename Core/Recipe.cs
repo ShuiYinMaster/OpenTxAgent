@@ -1,4 +1,4 @@
-// TxAgent / Core / Recipe.cs
+// TxTools.Agent / Core / Recipe.cs
 // 配方 = 一串对"现有工具"的调用 + 参数模板。是数据，不是代码。
 // 能力完全被已注册的原子工具集合框死，不引入超出现有工具的破坏面。
 // 局限（有意为之）：只能做"参数化的固定序列"，不支持分支/循环/条件——
@@ -8,7 +8,7 @@ using System.Collections.Generic;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
-namespace TxAgent.Core
+namespace TxTools.Agent.Core
 {
     public sealed class RecipeParam
     {

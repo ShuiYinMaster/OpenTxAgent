@@ -1,12 +1,12 @@
-// TxAgent / Tools / OperationTools.cs
+// TxTools.Agent / Tools / OperationTools.cs
 // 一组基于 PsReader 的只读原子工具。粒度细 -> 配方能组合出的解法越多。
 // 都作用于"当前选择"，返回文本摘要；PS 调用经 PsBridge -> PsContext 路由回主线程。
 
 using Newtonsoft.Json.Linq;
-using TxAgent.Core;
-using TxAgent.Ps;
+using TxTools.Agent.Core;
+using TxTools.Agent.Ps;
 
-namespace TxAgent.Tools
+namespace TxTools.Agent.Tools
 {
     /// <summary>列出当前选中的操作：名称 / 类型 / 绑定工具名。</summary>
     public sealed class ListOperationsTool : TxAgentToolBase
