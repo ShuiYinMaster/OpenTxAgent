@@ -151,7 +151,43 @@ namespace TxTools.Agent.Core
         private static readonly Regex LineColPattern =
             new Regex(@"\((\d+),\d+\)", RegexOptions.Compiled);
 
-        /// <summary>提取错误签名。抽不出时返回 null,表示这条错误不值得入库。</summary>
+        // 中英文的引号字符类:
+        //   U+0022 " 半角双引号     U+0027 ' 半角单引号
+        //   U+201C " 中文左双引号   U+201D " 中文右双引号
+        //   U+2018 ' 中文左单引号   U+2019 ' 中文右单引号
+        private const string QuoteChars = @"[""'\u201C\u201D\u2018\u2019]";
+
+        // CS1061 / CS0117 / 其他"XX 不包含 YY 的定义"类错误 —— 中英文引号都覆盖
+        //   中文: "Type"不包含"Member"的定义
+        //   英文: 'Type' does not contain a definition for 'Member'
+        // 报错消息结构完全一致,只差 CS 号,合并成一个通用 pattern。
+        private static readonly Regex CsQuotedTypeMemberPattern = new Regex(
+            @"CS\d{4}.*?" + QuoteChars + @"([\w\.]+)" + QuoteChars +
+            @".*?" + QuoteChars + @"([\w]+)" + QuoteChars,
+            RegexOptions.Compiled | RegexOptions.Singleline);
+
+        // CS0246 找不到类型或命名空间名:   "找不到类型或命名空间名 'XXX'"
+        private static readonly Regex Cs0246Pattern = new Regex(
+            @"CS0246.*?" + QuoteChars + @"([\w\.]+)" + QuoteChars,
+            RegexOptions.Compiled | RegexOptions.Singleline);
+
+        /// <summary>已知的命名空间前缀 — 提取 Type.Member 时跳过这些,避免误把命名空间当作类名。</summary>
+        private static readonly HashSet<string> NamespacePrefixes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "Tecnomatix", "Tecnomatix.Engineering", "Tecnomatix.Engineering.Ui",
+            "System", "System.Collections", "System.Collections.Generic", "System.IO",
+            "System.Text", "System.Text.RegularExpressions", "System.Linq",
+            "System.Threading", "System.Threading.Tasks", "System.Reflection",
+            "System.Windows.Forms", "System.Diagnostics",
+            "Newtonsoft.Json", "Newtonsoft.Json.Linq", "Microsoft.Web.WebView2",
+            "TxTools", "TxTools.Agent", "TxTools.Agent.Core"
+        };
+
+        /// <summary>
+        /// 提取错误签名。签名应精确到"具体报错的 Type.Member",不同 API 缺失应产生不同签名,
+        /// 这样避坑清单里每条正解才能对应精确的 API,而不是一坨笼统的 CS1061 归并。
+        /// 抽不出时返回 null,表示这条错误不值得入库。
+        /// </summary>
         public static string ExtractSignature(string errorOutput, string code)
         {
             if (string.IsNullOrEmpty(errorOutput)) return null;
@@ -159,21 +195,39 @@ namespace TxTools.Agent.Core
             // 1) TxNotImplementedException → 找目标 API
             if (TxNotImplPattern.IsMatch(errorOutput))
             {
-                var tm = TypeMemberPattern.Match(errorOutput);
-                var target = tm.Success ? tm.Value : FirstTypeMemberInCode(code);
+                var target = FindSpecificTypeMember(errorOutput) ?? FirstTypeMemberInCode(code);
                 if (string.IsNullOrEmpty(target)) target = "unknown";
                 return "TxNotImplementedException:" + target;
             }
 
-            // 2) C# 编译错误 CSxxxx
+            // 2) C# 编译错误 — 优先用具体模式提取 Type.Member
             var cs = CsErrorPattern.Match(errorOutput);
             if (cs.Success)
             {
                 var csCode = cs.Value;
-                // 优先从错误上下文抠 "Type.Member" 作为签名的可读部分
-                var tm = TypeMemberPattern.Match(errorOutput);
-                if (tm.Success) return csCode + ":" + tm.Value;
-                // 退化：CS 号 + 首行 hash
+
+                // 2a) CS1061 / CS0117 / 类似的"XX 不包含 YY 的定义"错误 —— 引号提取最准
+                //     覆盖中英文所有引号变体,不同 CS 号共用一个模式
+                var m = CsQuotedTypeMemberPattern.Match(errorOutput);
+                if (m.Success)
+                {
+                    var typeName = ShortTypeName(m.Groups[1].Value);
+                    var member = m.Groups[2].Value;
+                    return csCode + ":" + typeName + "." + member;
+                }
+
+                // 2b) CS0246: 找不到类型或命名空间名 —— 只有单个引号包裹的名字
+                if (csCode == "CS0246")
+                {
+                    var m2 = Cs0246Pattern.Match(errorOutput);
+                    if (m2.Success) return csCode + ":" + ShortTypeName(m2.Groups[1].Value);
+                }
+
+                // 2c) 兜底:从错误上下文遍历 Type.Member,跳过命名空间前缀,取第一个真正类名
+                var specific = FindSpecificTypeMember(errorOutput);
+                if (!string.IsNullOrEmpty(specific)) return csCode + ":" + specific;
+
+                // 2d) 最后退化:CS 号 + 首行 hash
                 return csCode + ":" + ShortHash(FirstLine(errorOutput));
             }
 
@@ -184,6 +238,39 @@ namespace TxTools.Agent.Core
                 return exMatch.Value + ":" + ShortHash(FirstLine(errorOutput));
             }
 
+            return null;
+        }
+
+        /// <summary>去掉命名空间前缀,只留最短类名。"Tecnomatix.Engineering.TxWeldOperation" → "TxWeldOperation"</summary>
+        private static string ShortTypeName(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName)) return fullName;
+            int dot = fullName.LastIndexOf('.');
+            return dot >= 0 ? fullName.Substring(dot + 1) : fullName;
+        }
+
+        /// <summary>
+        /// 从错误输出里遍历所有 Type.Member,跳过命名空间前缀(如 Tecnomatix.Engineering),
+        /// 返回第一个"真正类名+成员"的组合(如 TxWeldOperation.Parent)。
+        /// </summary>
+        private static string FindSpecificTypeMember(string errorOutput)
+        {
+            if (string.IsNullOrEmpty(errorOutput)) return null;
+            foreach (Match m in TypeMemberPattern.Matches(errorOutput))
+            {
+                var typePart = m.Groups[1].Value;
+                var memberPart = m.Groups[2].Value;
+
+                // 跳过命名空间前缀本身
+                if (NamespacePrefixes.Contains(typePart)) continue;
+
+                // 也跳过组合的命名空间(如 typePart="Tecnomatix" 后接 memberPart="Engineering" 拼起来还是命名空间)
+                var combined = typePart + "." + memberPart;
+                if (NamespacePrefixes.Contains(combined)) continue;
+
+                // 优先取形似 TxXxx 或 IXxx 之类真正的 PS SDK 类名
+                return m.Value;
+            }
             return null;
         }
 

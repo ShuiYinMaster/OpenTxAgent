@@ -46,6 +46,14 @@ namespace TxTools.Agent.UI
         private Conversation _current;
         private string _currentModel = DefaultModel;
 
+        /// <summary>
+        /// 审批模式,session 级(关窗归位): 
+        ///   ask       每次弹窗询问(默认,安全)
+        ///   auto_safe run_csharp 仍弹代码审阅框,其他变更工具自动通过
+        ///   auto_all  全部自动通过(含代码执行,危险)
+        /// </summary>
+        private string _approvalMode = "ask";
+
         // ── WebView2 ──
         private WebView2 _webView;
         private bool _webViewReady;
@@ -258,6 +266,21 @@ namespace TxTools.Agent.UI
                     case "switchModel":
                         SwitchModel((string)msg["model"]);
                         break;
+
+                    case "setApprovalMode":
+                        {
+                            var m = (string)msg["mode"];
+                            if (m == "ask" || m == "auto_safe" || m == "auto_all")
+                            {
+                                _approvalMode = m;
+                                var label = m == "ask" ? "\u8be2\u95ee"
+                                          : m == "auto_safe" ? "\u534a\u81ea\u52a8(\u4ee3\u7801\u4ecd\u5f39\u7a97)"
+                                          : "\u5168\u81ea\u52a8(\u542b\u4ee3\u7801)";
+                                PostStatus("\u5df2\u5207\u6362\u5ba1\u6279\u6a21\u5f0f: " + label);
+                                AuditLog.Write("APPROVAL-MODE = " + m);
+                            }
+                            break;
+                        }
 
                     case "userSend":
                         _ = HandleUserSendAsync((string)msg["text"], msg["attachments"] as JArray);
@@ -779,10 +802,28 @@ namespace TxTools.Agent.UI
             if (InvokeRequired)
                 return (bool)Invoke(new Func<bool>(() => AskApprovalNative(tool, input)));
 
+            // 是否属于代码执行类工具(输入里有 code 字符串) —— run_csharp 走 CodeApprovalDialog
+            bool isCode = input != null
+                          && input["code"] != null
+                          && input["code"].Type == JTokenType.String;
+
+            // 审批模式短路:
+            //   auto_all  → 一律放行(含代码)
+            //   auto_safe → 只对"非代码"变更放行,代码仍要弹窗审阅
+            if (_approvalMode == "auto_all")
+            {
+                AuditLog.Write("AUTO-ALL tool=" + tool.Name + "  input=" + Compact(input));
+                return true;
+            }
+            if (_approvalMode == "auto_safe" && !isCode)
+            {
+                AuditLog.Write("AUTO-SAFE tool=" + tool.Name + "  input=" + Compact(input));
+                return true;
+            }
+
             // run_csharp:代码审阅框
-            var codeTok = input != null ? input["code"] : null;
-            if (codeTok != null && codeTok.Type == JTokenType.String)
-                return CodeApprovalDialog.Show(this, tool.Name, (string)codeTok) == DialogResult.Yes;
+            if (isCode)
+                return CodeApprovalDialog.Show(this, tool.Name, (string)input["code"]) == DialogResult.Yes;
 
             // 其它变更工具:简单确认框
             var msg = "\u52a9\u624b\u8bf7\u6c42\u6267\u884c\u4e00\u4e2a\u4f1a\u6539\u52a8\u573a\u666f\u7684\u64cd\u4f5c\uff1a\n\n" +
@@ -815,6 +856,7 @@ namespace TxTools.Agent.UI
         //    { type:"jsReady" }
         //    { type:"setApiKey", key }
         //    { type:"switchModel", model }
+        //    { type:"setApprovalMode", mode:"ask"|"auto_safe"|"auto_all" }
         //    { type:"userSend", text, attachments:[{id,name}] }
         //    { type:"userStop" }
         //    { type:"newConv" }

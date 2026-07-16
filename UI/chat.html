@@ -717,6 +717,11 @@ button { font-family: inherit; }
 <div id="topbar">
     <span class="brand">TxAgent</span>
     <select id="model-select" title="选择模型"></select>
+    <select id="approval-mode" title="工具执行审批模式">
+        <option value="ask">审批·询问</option>
+        <option value="auto_safe">审批·半自动</option>
+        <option value="auto_all">审批·全自动</option>
+    </select>
     <span class="spacer"></span>
     <button id="btn-new" title="新对话">+ 新对话</button>
     <button id="btn-history" title="历史对话">历史</button>
@@ -850,6 +855,23 @@ window.dispatchMessage = function (json) {
 // ═════════════════════════════════════════════════════════════════
 document.getElementById("model-select").addEventListener("change", (e) => {
     postToHost({ type: "switchModel", model: e.target.value });
+});
+document.getElementById("approval-mode").addEventListener("change", (e) => {
+    const mode = e.target.value;
+    if (mode === "auto_all") {
+        const ok = confirm(
+            "确认切换到「全自动」审批模式?\n\n" +
+            "此模式下 AI 生成的 C# 代码(run_csharp)将直接执行,不再弹出代码审阅框。\n" +
+            "AI 可能创建/修改/删除场景对象,建议仅在验证过的会话中使用。\n\n" +
+            "确认继续?"
+        );
+        if (!ok) {
+            e.target.value = "ask";
+            postToHost({ type: "setApprovalMode", mode: "ask" });
+            return;
+        }
+    }
+    postToHost({ type: "setApprovalMode", mode: mode });
 });
 document.getElementById("btn-new").addEventListener("click", () => {
     postToHost({ type: "newConv" });
