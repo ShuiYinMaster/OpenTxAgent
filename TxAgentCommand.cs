@@ -9,6 +9,8 @@
 //   即使 Current 为 null(窗口未打开或刚关闭)也返回 null,不崩。
 
 using System;
+using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Windows.Forms;
 using Newtonsoft.Json.Linq;
@@ -128,7 +130,76 @@ namespace TxTools.Agent
             // 6) 预置内置配方(仅注册到内存,不写盘;启动即在,可被 list_recipes 看到)
             SeedDefaultRecipes(reg);
 
+            // 7) 自动发现:反射扫程序集里所有实现 ITxAgentTool 且有公共无参构造的类,
+            //    自动补注册。这样以后新加 XxxTool.cs 只要有默认构造函数,扔进项目即可,
+            //    不用再回来改这里。同名已注册的一律跳过 —— 上面手工注册的带参构造工具优先。
+            AutoRegisterTools(reg);
+
             return reg;
+        }
+
+        /// <summary>
+        /// 反射扫本程序集里所有实现 ITxAgentTool 且有公共无参构造函数的类,补注册到 reg。
+        /// 已存在同名工具则跳过 (避免覆盖上面 BuildToolRegistry 里手工注册的带依赖构造)。
+        /// 需要依赖注入的工具 (如 SaveRecipeTool(reg) / AddFactTool(convIdSupplier) / RecipeTool(recipe,reg))
+        /// 应继续在 BuildToolRegistry 里手工注册,它们没有无参构造,会被自动扫描自然忽略。
+        /// </summary>
+        private static void AutoRegisterTools(ToolRegistry reg)
+        {
+            var asm = typeof(TxAgentCommand).Assembly;
+            var toolType = typeof(ITxAgentTool);
+
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException ex)
+            {
+                // 某些类型的依赖 dll 缺失,只保留能加载的部分继续
+                types = ex.Types.Where(t => t != null).ToArray();
+            }
+
+            int registered = 0, skipped = 0, failed = 0;
+            foreach (var t in types)
+            {
+                if (t == null) continue;
+                if (t.IsAbstract || t.IsInterface || !t.IsClass) continue;
+                if (!toolType.IsAssignableFrom(t)) continue;
+
+                // 只处理有 public 无参构造的类;带参构造的靠上面手工注册
+                var ctor = t.GetConstructor(Type.EmptyTypes);
+                if (ctor == null) continue;
+
+                try
+                {
+                    var tool = (ITxAgentTool)ctor.Invoke(null);
+                    if (string.IsNullOrWhiteSpace(tool.Name))
+                    {
+                        System.Diagnostics.Debug.WriteLine("[TxAgent] 跳过空名工具类型: " + t.FullName);
+                        continue;
+                    }
+
+                    ITxAgentTool existing;
+                    if (reg.TryGet(tool.Name, out existing))
+                    {
+                        skipped++;
+                        continue; // 已注册,不覆盖
+                    }
+
+                    reg.Register(tool);
+                    registered++;
+                    System.Diagnostics.Debug.WriteLine(
+                        "[TxAgent] auto-registered: " + tool.Name + "  (" + t.FullName + ")");
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    System.Diagnostics.Debug.WriteLine(
+                        "[TxAgent] auto-register failed: " + t.FullName + " -> " + ex.Message);
+                }
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                "[TxAgent] AutoRegisterTools 完成: new=" + registered
+                + " skipped=" + skipped + " failed=" + failed);
         }
 
         /// <summary>预置几条开箱即用的只读配方(都由现有只读工具组合，免审批)。</summary>
