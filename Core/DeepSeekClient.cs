@@ -1,6 +1,7 @@
 // TxTools.Agent / Core / DeepSeekClient.cs
-// 直连 https://api.deepseek.com/chat/completions 的薄客户端 (OpenAI 兼容)。
-// 网络要求: PS 工作站需放行到 api.deepseek.com 的出站 HTTPS。
+// 直连 OpenAI 兼容 /v1/chat/completions 的薄客户端 (baseUrl 可配置)。
+// 类名沿用历史命名,内部完全 provider 中立 —— 换用 DeepSeek / Kimi / Qwen / OpenAI / Ollama 
+// 只需构造时传对应 baseUrl。网络要求: 目标 host 出站 HTTPS(Ollama 是本地 HTTP)可达。
 
 using System;
 using System.Collections.Generic;
@@ -18,35 +19,87 @@ namespace TxTools.Agent.Core
 {
     public sealed class DeepSeekClient
     {
-        // base_url 末尾的 v1 与模型版本无关；这里直接用根域 + /chat/completions。
-        private const string Endpoint = "https://api.deepseek.com/chat/completions";
+        public const string DefaultBaseUrl = "https://api.deepseek.com";
 
         private static readonly HttpClient Http = CreateHttp();
         private static readonly JsonSerializerSettings JsonSettings =
             new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore };
 
         private readonly string _apiKey;
+        /// <summary>完整 endpoint,如 https://api.deepseek.com/v1/chat/completions</summary>
+        private readonly string _endpoint;
+        /// <summary>模型列表 endpoint,如 https://api.deepseek.com/v1/models</summary>
+        private readonly string _modelsEndpoint;
 
         static DeepSeekClient()
         {
-            // .NET Framework 默认可能不启用 TLS1.2，否则握手直接失败。
+            // .NET Framework 默认可能不启用 TLS1.2,否则握手直接失败。
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
         }
 
-        public DeepSeekClient(string apiKey)
+        public DeepSeekClient(string apiKey) : this(apiKey, DefaultBaseUrl) { }
+
+        public DeepSeekClient(string apiKey, string baseUrl)
         {
             if (string.IsNullOrWhiteSpace(apiKey))
                 throw new ArgumentException("API key 不能为空。", nameof(apiKey));
             _apiKey = apiKey.Trim();
+            var b = string.IsNullOrWhiteSpace(baseUrl) ? DefaultBaseUrl : baseUrl.Trim().TrimEnd('/');
+            _endpoint = b + "/v1/chat/completions";
+            _modelsEndpoint = b + "/v1/models";
+        }
+
+        /// <summary>
+        /// 拉取当前 provider 真实的模型列表(OpenAI 兼容: GET /v1/models → {data: [{id: "..."}, ...]})。
+        /// 五家 DeepSeek/Kimi/Qwen/OpenAI/Ollama 都支持。抛异常表示 API 不响应或返回格式不合规。
+        /// </summary>
+        public async Task<List<string>> ListModelsAsync(CancellationToken ct)
+        {
+            using (var msg = new HttpRequestMessage(HttpMethod.Get, _modelsEndpoint))
+            {
+                msg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+                using (var resp = await Http.SendAsync(msg, HttpCompletionOption.ResponseContentRead, ct))
+                {
+                    var body = await resp.Content.ReadAsStringAsync();
+                    if (!resp.IsSuccessStatusCode)
+                        throw new LlmApiException((int)resp.StatusCode, ExtractError(body, resp.StatusCode), body);
+
+                    var root = JObject.Parse(body);
+                    var data = root["data"] as JArray;
+                    if (data == null) return new List<string>();
+
+                    var list = new List<string>();
+                    foreach (var item in data)
+                    {
+                        var id = (string)item["id"];
+                        if (!string.IsNullOrWhiteSpace(id)) list.Add(id);
+                    }
+                    return list;
+                }
+            }
         }
 
         public async Task<ChatResponse> SendAsync(ChatRequest request, CancellationToken ct)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
+            try
+            {
+                return await SendOnceAsync(request, ct);
+            }
+            catch (LlmApiException ex) when (ShouldRetryWithoutTemperature(ex, request))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[DeepSeekClient] 400 temperature 不支持,自动去掉 temperature 重试: " + ex.Message);
+                request.Temperature = null;
+                return await SendOnceAsync(request, ct);
+            }
+        }
 
+        private async Task<ChatResponse> SendOnceAsync(ChatRequest request, CancellationToken ct)
+        {
             var json = JsonConvert.SerializeObject(request, JsonSettings);
 
-            using (var msg = new HttpRequestMessage(HttpMethod.Post, Endpoint))
+            using (var msg = new HttpRequestMessage(HttpMethod.Post, _endpoint))
             {
                 msg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
                 msg.Content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -72,10 +125,26 @@ namespace TxTools.Agent.Core
             CancellationToken ct, Action<TokenUsage> onUsage = null)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
+            try
+            {
+                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage);
+            }
+            catch (LlmApiException ex) when (ShouldRetryWithoutTemperature(ex, request))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[DeepSeekClient] 400 temperature 不支持,自动去掉 temperature 重试: " + ex.Message);
+                request.Temperature = null;
+                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage);
+            }
+        }
+
+        private async Task<ChatMessage> SendStreamOnceAsync(ChatRequest request, Action<string> onTextDelta,
+            CancellationToken ct, Action<TokenUsage> onUsage)
+        {
             request.Stream = true;
             var json = JsonConvert.SerializeObject(request, JsonSettings);
 
-            using (var msg = new HttpRequestMessage(HttpMethod.Post, Endpoint))
+            using (var msg = new HttpRequestMessage(HttpMethod.Post, _endpoint))
             {
                 msg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
                 msg.Content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -169,6 +238,24 @@ namespace TxTools.Agent.Core
             public string Id;
             public string Name;
             public readonly StringBuilder Args = new StringBuilder();
+        }
+
+        /// <summary>
+        /// 判断是否应该"去掉 temperature 参数后重试":
+        ///   - HTTP 400 (invalid_request_error)
+        ///   - 错误消息含 "temperature"
+        ///   - 当前 request 确实带了 temperature (未曾发生过重试)
+        /// 已知触发场景:
+        ///   - Kimi(Moonshot) k2 系列: "invalid temperature: only 1 is allowed for this model"
+        ///   - OpenAI o1/o3 系列:      "'temperature' does not support 0.3 with this model. Only ..."
+        /// 宽松匹配 —— 只要 400 + msg 含 temperature 就重试,不追具体表述,避免 provider 措辞变化。
+        /// </summary>
+        private static bool ShouldRetryWithoutTemperature(LlmApiException ex, ChatRequest request)
+        {
+            if (ex.StatusCode != 400) return false;
+            if (request == null || !request.Temperature.HasValue) return false;
+            var msg = ex.Message ?? "";
+            return msg.IndexOf("temperature", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string ExtractError(string body, HttpStatusCode code)

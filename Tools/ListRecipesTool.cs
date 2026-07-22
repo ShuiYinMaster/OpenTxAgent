@@ -27,7 +27,14 @@ namespace TxTools.Agent.Tools
             sb.AppendLine("已保存配方 " + recipes.Count + " 条：");
             foreach (var r in recipes)
             {
-                sb.Append("• ").Append(r.Name).Append(" — ").Append(r.Description ?? "");
+                // 工具名(API function.name)必须是 ^[a-zA-Z0-9_-]+$,
+                // 显示 API 安全名;若与原文不同则附上原文。
+                var apiName = Recipe.ToApiSafeName(r.Name);
+                var display = apiName;
+                if (!string.Equals(apiName, r.Name, System.StringComparison.Ordinal))
+                    display = apiName + " (显示名: " + r.Name + ")";
+
+                sb.Append("• ").Append(display).Append(" — ").Append(r.Description ?? "");
                 if (r.Parameters != null && r.Parameters.Count > 0)
                 {
                     sb.Append(" [参数: ");

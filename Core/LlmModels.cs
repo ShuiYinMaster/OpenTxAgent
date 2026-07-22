@@ -19,7 +19,7 @@ namespace TxTools.Agent.Core
         public List<ToolDef> Tools { get; set; }
 
         [JsonProperty("max_tokens")] public int MaxTokens { get; set; }
-        [JsonProperty("temperature")] public double Temperature { get; set; }
+        [JsonProperty("temperature")] public double? Temperature { get; set; }
         [JsonProperty("stream")] public bool Stream { get; set; }
     }
 
@@ -76,9 +76,9 @@ namespace TxTools.Agent.Core
     /// <summary>API 返回的 token 用量（prompt_tokens / completion_tokens / total_tokens）。</summary>
     public sealed class TokenUsage
     {
-        [JsonProperty("prompt_tokens")]     public int PromptTokens { get; set; }
+        [JsonProperty("prompt_tokens")] public int PromptTokens { get; set; }
         [JsonProperty("completion_tokens")] public int CompletionTokens { get; set; }
-        [JsonProperty("total_tokens")]      public int TotalTokens { get; set; }
+        [JsonProperty("total_tokens")] public int TotalTokens { get; set; }
     }
 
     public sealed class ChatResponse

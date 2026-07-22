@@ -35,8 +35,6 @@ namespace TxTools.Agent.UI
     public sealed class TxAgentForm : TxForm
     {
         private static readonly System.Drawing.Size DesignSize = new System.Drawing.Size(560, 720);
-        private static readonly string[] AvailableModels = { "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat" };
-        private const string DefaultModel = "deepseek-v4-pro";
 
         // ── 依赖 ──
         private readonly ToolRegistry _tools;
@@ -44,7 +42,10 @@ namespace TxTools.Agent.UI
         private AgentLoop _loop;
         private CancellationTokenSource _cts;
         private Conversation _current;
-        private string _currentModel = DefaultModel;
+
+        // ── LLM Provider / Model 状态 ──
+        private string _currentProviderId = LlmProviders.DefaultProviderId;
+        private string _currentModel = LlmProviders.All[0].Models[0];
 
         /// <summary>
         /// 审批模式,session 级(关窗归位): 
@@ -54,10 +55,24 @@ namespace TxTools.Agent.UI
         /// </summary>
         private string _approvalMode = "ask";
 
+        /// <summary>
+        /// 当前挂起的 HTML 审批请求。ApprovalRequest 委托签名同步返回 bool,
+        /// 我们通过 TCS 在后台线程 (Task.Run 里的线程池线程) 阻塞等 JS 响应。
+        /// UI 线程收到 approvalResult 消息 → TrySetResult → 后台线程解除阻塞。
+        /// </summary>
+        private TaskCompletionSource<bool> _pendingApproval;
+        private readonly object _pendingApprovalLock = new object();
+
         // ── WebView2 ──
         private WebView2 _webView;
         private bool _webViewReady;
         private bool _dpiApplied;
+
+        // ── 加载覆盖 (WebView 初始化期间遮盖空白,防止用户以为界面卡死) ──
+        private System.Windows.Forms.Panel _loadingOverlay;
+        private System.Windows.Forms.Label _loadingLabel;
+        private System.Windows.Forms.Timer _loadingTimer;
+        private int _loadingDotCount;
 
         public TxAgentForm(SynchronizationContext psCtx, ToolRegistry tools)
         {
@@ -79,6 +94,35 @@ namespace TxTools.Agent.UI
 
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
+
+            // 加载遮罩 —— 覆盖整个 form 内容区,WebView 就绪之前显示。
+            // ZOrder: Panel 后加 BringToFront 确保在 WebView 之上。
+            _loadingOverlay = new System.Windows.Forms.Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = System.Drawing.Color.White
+            };
+            _loadingLabel = new System.Windows.Forms.Label
+            {
+                Text = "\u6b63\u5728\u52a0\u8f7d TxAgent UI",
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                Font = new System.Drawing.Font("Microsoft YaHei UI", 11f),
+                ForeColor = System.Drawing.Color.FromArgb(120, 120, 120),
+                BackColor = System.Drawing.Color.Transparent
+            };
+            _loadingOverlay.Controls.Add(_loadingLabel);
+            Controls.Add(_loadingOverlay);
+            _loadingOverlay.BringToFront();
+
+            _loadingTimer = new System.Windows.Forms.Timer { Interval = 400 };
+            _loadingTimer.Tick += (s, e) =>
+            {
+                _loadingDotCount = (_loadingDotCount + 1) % 4;
+                string dots = new string('.', _loadingDotCount);
+                _loadingLabel.Text = "\u6b63\u5728\u52a0\u8f7d TxAgent UI " + dots;
+            };
         }
 
         public override void OnInitTxForm()
@@ -91,11 +135,14 @@ namespace TxTools.Agent.UI
         {
             base.OnLoad(e);
             FormUiKit.ApplyDpiScaling(this, ref _dpiApplied, DesignSize);
+            _loadingTimer.Start();
             InitWebViewAsync();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            // 若正等审批,视为拒绝解除阻塞,让后台线程能退出
+            ReleasePendingApproval(false);
             FireExtractLessons();                // 关窗前对当前对话跑一次经验萃取
             try { UploadStore.ClearAll(); } catch { }
             AgentLoop.Current = null;
@@ -255,13 +302,18 @@ namespace TxTools.Agent.UI
                 switch (type)
                 {
                     case "jsReady":
-                        _webViewReady = true;
                         OnJsReady();
                         break;
 
                     case "setApiKey":
-                        ApplyKey((string)msg["key"], persist: true);
-                        break;
+                        {
+                            var newKey = (string)msg["key"];
+                            var pid = (string)msg["providerId"];
+                            if (!string.IsNullOrWhiteSpace(pid))
+                                _currentProviderId = pid;
+                            ApplyKey(newKey, persist: true);
+                            break;
+                        }
 
                     case "switchModel":
                         SwitchModel((string)msg["model"]);
@@ -278,6 +330,7 @@ namespace TxTools.Agent.UI
                                           : "\u5168\u81ea\u52a8(\u542b\u4ee3\u7801)";
                                 PostStatus("\u5df2\u5207\u6362\u5ba1\u6279\u6a21\u5f0f: " + label);
                                 AuditLog.Write("APPROVAL-MODE = " + m);
+                                try { UserPrefsStore.UpdateApprovalMode(m); } catch { }
                             }
                             break;
                         }
@@ -288,7 +341,16 @@ namespace TxTools.Agent.UI
 
                     case "userStop":
                         try { if (_cts != null) _cts.Cancel(); } catch { }
+                        // 若此时正等待审批,视为拒绝解除阻塞,让 SendAsync 尽快返回
+                        ReleasePendingApproval(false);
                         break;
+
+                    case "approvalResult":
+                        {
+                            bool allow = msg["allow"] != null && (bool)msg["allow"];
+                            ReleasePendingApproval(allow);
+                            break;
+                        }
 
                     case "newConv":
                         NewConversation();
@@ -344,23 +406,105 @@ namespace TxTools.Agent.UI
         /// <summary>JS 侧完成初始化后调用。发初始化数据、恢复上次对话或触发 API Key 输入。</summary>
         private void OnJsReady()
         {
-            // 1) 可选模型列表
-            PostJs(new { type = "modelList", items = AvailableModels, current = _currentModel });
+            _webViewReady = true;
 
-            // 2) 加载 API Key
-            var saved = KeyStore.Load();
-            if (!string.IsNullOrWhiteSpace(saved))
+            // 隐藏加载遮罩,让 WebView 显示出来
+            try
             {
-                ApplyKey(saved, persist: false);
+                if (_loadingTimer != null) _loadingTimer.Stop();
+                if (_loadingOverlay != null) _loadingOverlay.Visible = false;
+            }
+            catch { }
+
+            // v3: 加载用户偏好 —— 恢复上次的 provider/model/审批模式,和各 provider 的模型列表缓存
+            try
+            {
+                var prefs = UserPrefsStore.Load();
+                if (!string.IsNullOrWhiteSpace(prefs.ProviderId)) _currentProviderId = prefs.ProviderId;
+                if (!string.IsNullOrWhiteSpace(prefs.Model)) _currentModel = prefs.Model;
+                if (!string.IsNullOrWhiteSpace(prefs.ApprovalMode)) _approvalMode = prefs.ApprovalMode;
+
+                if (prefs.Models != null)
+                {
+                    foreach (var kv in prefs.Models)
+                    {
+                        var p = LlmProviders.ById(kv.Key);
+                        if (p != null && kv.Value != null && kv.Value.List != null && kv.Value.List.Length > 0)
+                            p.Models = kv.Value.List;
+                    }
+                }
+
+                // 若上次记的 model 已不在当前 provider 的 models 里(可能被清理或名字变了),回落到第一个
+                var provCur = LlmProviders.ById(_currentProviderId);
+                if (provCur.Models.Length > 0 && Array.IndexOf(provCur.Models, _currentModel) < 0)
+                    _currentModel = provCur.Models[0];
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[TxAgent] load prefs failed: " + ex.Message);
+            }
+
+            // 1) 全部提供商 + 模型列表 (分组显示,已含缓存)
+            PostProviderAndModelList();
+
+            // 2) 推审批模式让前端 select 恢复选中
+            PostJs(new { type = "approvalMode", value = _approvalMode });
+
+            // 3) 加载当前 provider 的 API Key
+            var saved = KeyStore.Load(_currentProviderId);
+            var prov = LlmProviders.ById(_currentProviderId);
+            if (!string.IsNullOrWhiteSpace(saved) || prov.IsLocal)
+            {
+                ApplyKey(saved ?? "ollama", persist: false);   // Ollama 无需真 key,占位一个
                 LoadMostRecentOrNew();
                 PostJs(new { type = "keyReady" });
-                PostStatus("\u5df2\u52a0\u8f7d API Key\u3002\u5de5\u5177 " + _tools.Count + " \u4e2a\u3002");
+                PostStatus("\u5df2\u52a0\u8f7d " + prov.DisplayName + "\u3002\u5de5\u5177 " + _tools.Count + " \u4e2a\u3002");
             }
             else
             {
-                PostStatus("\u5c1a\u672a\u8bbe\u7f6e API Key\u3002");
-                PostJs(new { type = "askApiKey", reason = "\u9996\u6b21\u4f7f\u7528\u9700\u8981\u8bbe\u7f6e DeepSeek API Key\u3002" });
+                PostStatus("\u5c1a\u672a\u8bbe\u7f6e " + prov.DisplayName + " API Key\u3002");
+                PostAskApiKey(prov, "\u9996\u6b21\u4f7f\u7528\u9700\u8981\u8bbe\u7f6e " + prov.DisplayName + " \u7684 API Key\u3002");
             }
+        }
+
+        /// <summary>发送全部 provider 及其模型列表(前端用 optgroup 分组显示),同时告诉当前选中。</summary>
+        private void PostProviderAndModelList()
+        {
+            var providers = new List<object>();
+            foreach (var p in LlmProviders.All)
+            {
+                providers.Add(new
+                {
+                    id = p.Id,
+                    displayName = p.DisplayName,
+                    baseUrl = p.BaseUrl,
+                    isLocal = p.IsLocal,
+                    keyPageUrl = p.KeyPageUrl,
+                    models = p.Models
+                });
+            }
+            PostJs(new
+            {
+                type = "modelList",
+                providers,
+                currentProvider = _currentProviderId,
+                current = _currentModel
+            });
+        }
+
+        /// <summary>发 askApiKey 消息给 JS,附带当前 provider 的元数据方便 modal 展示。</summary>
+        private void PostAskApiKey(LlmProvider prov, string reason)
+        {
+            PostJs(new
+            {
+                type = "askApiKey",
+                reason,
+                providerId = prov.Id,
+                providerName = prov.DisplayName,
+                baseUrl = prov.BaseUrl,
+                keyPageUrl = prov.KeyPageUrl,
+                isLocal = prov.IsLocal
+            });
         }
 
         // ─────────────────────────────────────────────────────
@@ -592,19 +736,28 @@ namespace TxTools.Agent.UI
 
         private void ApplyKey(string key, bool persist)
         {
+            var prov = LlmProviders.ById(_currentProviderId);
+            // Ollama 本地不需要 key,但 HTTP Bearer header 不能空,填占位
+            if (string.IsNullOrWhiteSpace(key) && prov.IsLocal) key = "ollama";
             if (string.IsNullOrWhiteSpace(key)) { PostStatus("API Key \u4e3a\u7a7a\u3002"); return; }
             try
             {
-                _client = new DeepSeekClient(key);
+                _client = new DeepSeekClient(key, prov.BaseUrl);
                 _loop = BuildLoop(_client);
                 if (_current != null) _loop.LoadHistory(_current.Messages);
 
-                if (persist)
+                if (persist && !prov.IsLocal)
                 {
-                    try { KeyStore.Save(key); } catch { }
-                    PostStatus("\u5df2\u4fdd\u5b58 API Key\u3002");
+                    try { KeyStore.Save(key, prov.Id); } catch { }
+                    PostStatus("\u5df2\u4fdd\u5b58 " + prov.DisplayName + " API Key\u3002");
                 }
                 PostJs(new { type = "keyReady" });
+
+                // 记住 provider 选择 (下次开窗自动恢复)
+                try { UserPrefsStore.UpdateChoice(_currentProviderId, _currentModel); } catch { }
+
+                // Key 就绪后异步拉取该 provider 真实的模型列表(替换硬编码默认)
+                FetchProviderModelsAsync(prov);
 
                 if (_current == null) LoadMostRecentOrNew();
             }
@@ -614,15 +767,98 @@ namespace TxTools.Agent.UI
             }
         }
 
+        /// <summary>
+        /// fire-and-forget 拉取当前 provider 的真实模型列表(GET /v1/models),成功后替换
+        /// LlmProviders.All 对应项的 Models 数组,并推送新的 modelList 给前端刷新下拉。
+        /// 失败保留硬编码默认列表,静默(仅 Debug 输出)。同一 provider 5 分钟内不重复拉。
+        /// </summary>
+        private static readonly Dictionary<string, DateTime> _lastModelFetch =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+
+        private void FetchProviderModelsAsync(LlmProvider prov)
+        {
+            if (prov == null || _client == null) return;
+
+            DateTime last;
+            if (_lastModelFetch.TryGetValue(prov.Id, out last)
+                && (DateTime.UtcNow - last) < TimeSpan.FromMinutes(5))
+                return; // 5 分钟内已拉过,跳过
+
+            var client = _client;
+            var pid = prov.Id;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var models = await client.ListModelsAsync(CancellationToken.None);
+                    if (models == null || models.Count == 0) return;
+
+                    // 排序:让当前选中的模型排最前,其他按字母序
+                    models.Sort(StringComparer.OrdinalIgnoreCase);
+                    var curModel = _currentModel;
+                    if (!string.IsNullOrEmpty(curModel) && models.Contains(curModel))
+                    {
+                        models.Remove(curModel);
+                        models.Insert(0, curModel);
+                    }
+
+                    _lastModelFetch[pid] = DateTime.UtcNow;
+
+                    // 回 UI 线程更新 provider.Models + 推 modelList + 落盘缓存
+                    Action apply = () =>
+                    {
+                        var target = LlmProviders.ById(pid);
+                        target.Models = models.ToArray();
+                        PostProviderAndModelList();
+                        PostStatus("\u5df2\u5237\u65b0 " + target.DisplayName + " \u6a21\u578b\u5217\u8868 ("
+                            + models.Count + " \u4e2a)");
+                        // 落盘,下次开窗立即用缓存,不再显示硬编码默认
+                        try { UserPrefsStore.UpdateModels(pid, target.Models); } catch { }
+                    };
+                    if (InvokeRequired) BeginInvoke(apply);
+                    else apply();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        "[TxAgent] FetchProviderModels(" + pid + ") failed: " + ex.Message);
+                }
+            });
+        }
+
+        /// <summary>切换模型。若模型属于不同 provider,自动重载对应 key 并重建 client。</summary>
         private void SwitchModel(string model)
         {
             if (string.IsNullOrWhiteSpace(model)) return;
+
+            var targetProv = LlmProviders.FindByModel(model);
+            bool changedProvider = !string.Equals(targetProv.Id, _currentProviderId, StringComparison.Ordinal);
+
             _currentModel = model;
+
+            if (changedProvider)
+            {
+                _currentProviderId = targetProv.Id;
+                // 换 provider 需要拿新的 key + 新的 baseUrl 重建 client
+                var newKey = KeyStore.Load(targetProv.Id);
+                if (string.IsNullOrWhiteSpace(newKey) && !targetProv.IsLocal)
+                {
+                    // 新 provider 没 key —— 弹 Key modal 让用户填,填完后自动重建 client
+                    _client = null;
+                    _loop = null;
+                    PostStatus("\u5df2\u9009\u4e2d " + targetProv.DisplayName + " / " + model + ",\u9700\u5148\u8bbe\u7f6e API Key\u3002");
+                    PostAskApiKey(targetProv, "\u5207\u6362\u5230 " + targetProv.DisplayName + ",\u9700\u8981\u8bbe\u7f6e\u5bf9\u5e94\u7684 API Key\u3002");
+                    return;
+                }
+                _client = new DeepSeekClient(newKey ?? "ollama", targetProv.BaseUrl);
+            }
+
             if (_client == null) { PostStatus("\u5df2\u9884\u9009\u6a21\u578b: " + model); return; }
             _loop = BuildLoop(_client);
             _loop.LoadHistory(_current != null ? _current.Messages : new List<ChatMessage>());
             if (_current != null) RestoreTranscriptToJs(_current.Messages);
-            PostStatus("\u5df2\u5207\u6362\u6a21\u578b\u4e3a " + model + "\uff0c\u8bb0\u5fc6\u4fdd\u7559\u3002");
+            try { UserPrefsStore.UpdateChoice(_currentProviderId, _currentModel); } catch { }
+            PostStatus("\u5df2\u5207\u6362\u6a21\u578b\u4e3a " + targetProv.DisplayName + " / " + model + "\uff0c\u8bb0\u5fc6\u4fdd\u7559\u3002");
         }
 
         // ─────────────────────────────────────────────────────
@@ -773,7 +1009,7 @@ namespace TxTools.Agent.UI
                 PostJs(new { type = "toolResult", name = name, result = result, isErr = isErr });
                 PostStatus("\u5c31\u7eea\u3002");
             };
-            loop.ApprovalRequest = AskApprovalNative;
+            loop.ApprovalRequest = AskApproval;
             loop.HistoryChanged += SaveCurrent;
             loop.TokenUsed += (p, c, t) => PostTokenUsage(loop.TotalPromptTokens, loop.TotalCompletionTokens, loop.TotalTokens);
 
@@ -794,22 +1030,26 @@ namespace TxTools.Agent.UI
         }
 
         // ─────────────────────────────────────────────────────
-        //  审批 —— 保留原生弹窗(ApprovalRequest 委托必须同步返回)
+        //  审批 —— HTML modal 优先,原生弹窗仅作 fallback
+        //
+        //  同步性:ApprovalRequest 委托签名要求同步返回 bool。
+        //  RunOneTool 在 AgentLoop.SendAsync 内被调用,而 SendAsync 由
+        //  HandleUserSendAsync 里的 Task.Run 包起来跑,处于线程池线程 —— 因此
+        //  在这里同步 tcs.Task.Result 阻塞是安全的,UI 线程不受影响,依然能
+        //  接收 WebMessageReceived 触发 TrySetResult 解除阻塞。
+        //
+        //  两个例外场景走原生 fallback:
+        //   (a) WebView 尚未就绪 (初始化早期,几乎不会遇到);
+        //   (b) 已经在 UI 线程调用 (会死锁 —— UI 线程等自己发消息回自己)。
         // ─────────────────────────────────────────────────────
 
-        private bool AskApprovalNative(ITxAgentTool tool, JObject input)
+        private bool AskApproval(ITxAgentTool tool, JObject input)
         {
-            if (InvokeRequired)
-                return (bool)Invoke(new Func<bool>(() => AskApprovalNative(tool, input)));
-
-            // 是否属于代码执行类工具(输入里有 code 字符串) —— run_csharp 走 CodeApprovalDialog
             bool isCode = input != null
                           && input["code"] != null
                           && input["code"].Type == JTokenType.String;
 
-            // 审批模式短路:
-            //   auto_all  → 一律放行(含代码)
-            //   auto_safe → 只对"非代码"变更放行,代码仍要弹窗审阅
+            // 审批模式短路(与原逻辑一致)
             if (_approvalMode == "auto_all")
             {
                 AuditLog.Write("AUTO-ALL tool=" + tool.Name + "  input=" + Compact(input));
@@ -821,11 +1061,87 @@ namespace TxTools.Agent.UI
                 return true;
             }
 
-            // run_csharp:代码审阅框
+            // WebView 未就绪或在 UI 线程 → 兜底原生弹窗
+            if (!_webViewReady || !InvokeRequired)
+                return AskApprovalNative(tool, input, isCode);
+
+            return AskApprovalHtml(tool, input, isCode);
+        }
+
+        /// <summary>
+        /// 通过 HTML modal 请求审批。发消息给 JS 展示 modal → JS 用户点按钮
+        /// → C# WebMessageReceived 收到 approvalResult → TrySetResult 解除本方法的阻塞。
+        /// 只能在非 UI 线程调用,否则会自己等自己死锁。
+        /// </summary>
+        private bool AskApprovalHtml(ITxAgentTool tool, JObject input, bool isCode)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            lock (_pendingApprovalLock)
+            {
+                // 如果之前有挂着的(异常情况),视为拒绝先释放,再上新的
+                if (_pendingApproval != null) _pendingApproval.TrySetResult(false);
+                _pendingApproval = tcs;
+            }
+
+            try
+            {
+                object payload;
+                if (isCode)
+                {
+                    payload = new
+                    {
+                        type = "askApproval",
+                        kind = "code",
+                        tool = tool.Name,
+                        code = (string)input["code"]
+                    };
+                }
+                else
+                {
+                    payload = new
+                    {
+                        type = "askApproval",
+                        kind = "generic",
+                        tool = tool.Name,
+                        description = tool.Description ?? "",
+                        input = Compact(input)
+                    };
+                }
+                PostJs(payload);
+
+                // 同步阻塞等 JS 响应(见方法顶注释,安全前提: 我们不在 UI 线程)
+                return tcs.Task.Result;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                lock (_pendingApprovalLock)
+                {
+                    if (_pendingApproval == tcs) _pendingApproval = null;
+                }
+            }
+        }
+
+        /// <summary>解除当前挂起的审批(视为传入的 allow 结果)。多次调用幂等。</summary>
+        private void ReleasePendingApproval(bool allow)
+        {
+            TaskCompletionSource<bool> tcs;
+            lock (_pendingApprovalLock) { tcs = _pendingApproval; }
+            if (tcs != null) tcs.TrySetResult(allow);
+        }
+
+        /// <summary>原生弹窗兜底 —— WebView 未就绪或已在 UI 线程时用。</summary>
+        private bool AskApprovalNative(ITxAgentTool tool, JObject input, bool isCode)
+        {
+            if (InvokeRequired)
+                return (bool)Invoke(new Func<bool>(() => AskApprovalNative(tool, input, isCode)));
+
             if (isCode)
                 return CodeApprovalDialog.Show(this, tool.Name, (string)input["code"]) == DialogResult.Yes;
 
-            // 其它变更工具:简单确认框
             var msg = "\u52a9\u624b\u8bf7\u6c42\u6267\u884c\u4e00\u4e2a\u4f1a\u6539\u52a8\u573a\u666f\u7684\u64cd\u4f5c\uff1a\n\n" +
                       "\u5de5\u5177: " + tool.Name + "\n\u53c2\u6570: " + Compact(input) + "\n\n\u662f\u5426\u5141\u8bb8\uff1f";
             return MessageBox.Show(this, msg, "\u64cd\u4f5c\u786e\u8ba4", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
@@ -865,12 +1181,14 @@ namespace TxTools.Agent.UI
         //    { type:"deleteConv", id }
         //    { type:"uploadFile", filename, contentBase64 }
         //    { type:"removeAttachment", id }
+        //    { type:"approvalResult", allow }
         //    { type:"extractLessons" }
         //
         //  C# → JS (dispatchMessage(...)):
         //    { type:"modelList", items, current }
         //    { type:"keyReady" }
         //    { type:"askApiKey", reason }
+        //    { type:"askApproval", kind:"code"|"generic", tool, code?, description?, input? }
         //    { type:"convList", items:[{id,title,updated}] }
         //    { type:"clear" }
         //    { type:"restore", messages:[...] }

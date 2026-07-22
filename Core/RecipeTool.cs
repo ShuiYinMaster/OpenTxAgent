@@ -27,11 +27,22 @@ namespace TxTools.Agent.Core
             _registry = registry;
         }
 
-        public string Name { get { return _recipe.Name; } }
+        // 工具名必须匹配 ^[a-zA-Z0-9_-]+$ (API function.name 要求)。
+        // 配方 Name 存原文(可含中文), 此处用 ToApiSafeName 转成 API 安全名。
+        public string Name { get { return Recipe.ToApiSafeName(_recipe.Name); } }
 
         public string Description
         {
-            get { return "(配方) " + (_recipe.Description ?? "") + " — 由现有工具组合而成。"; }
+            get
+            {
+                var baseDesc = "(配方) " + (_recipe.Description ?? "") + " — 由现有工具组合而成。";
+                // 若净化后的 API 名与原文不同，在描述里带上原文名方便 LLM 识别
+                var apiName = Recipe.ToApiSafeName(_recipe.Name);
+                if (!string.Equals(apiName, _recipe.Name, System.StringComparison.Ordinal))
+                    baseDesc = "(配方: " + _recipe.Name + ") " + (_recipe.Description ?? "")
+                             + " — 由现有工具组合而成。";
+                return baseDesc;
+            }
         }
 
         public bool IsReadOnly

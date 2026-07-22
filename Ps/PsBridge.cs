@@ -54,6 +54,37 @@ namespace TxTools.Agent.Ps
             });
         }
 
+        // 在不知道目标属性精确类型时，从字符串尝试设置属性（支持 string/enum/ctor(string)/Parse/Convert）
+        private static void SetPropertyFromString(object target, string propName, string value)
+        {
+            if (target == null || string.IsNullOrWhiteSpace(propName) || value == null) return;
+            try
+            {
+                var t = target.GetType();
+                var p = t.GetProperty(propName);
+                if (p == null || !p.CanWrite) return;
+                var pt = p.PropertyType;
+
+                if (pt == typeof(string)) { p.SetValue(target, value, null); return; }
+                if (pt.IsEnum)
+                {
+                    try { var ev = Enum.Parse(pt, value, true); p.SetValue(target, ev, null); return; } catch { }
+                }
+                var ctor = pt.GetConstructor(new[] { typeof(string) });
+                if (ctor != null)
+                {
+                    try { var obj = ctor.Invoke(new object[] { value }); p.SetValue(target, obj, null); return; } catch { }
+                }
+                var mi = pt.GetMethod("Parse", new[] { typeof(string) });
+                if (mi != null && mi.IsStatic)
+                {
+                    try { var obj = mi.Invoke(null, new object[] { value }); p.SetValue(target, obj, null); return; } catch { }
+                }
+                try { var cv = Convert.ChangeType(value, pt); p.SetValue(target, cv, null); return; } catch { }
+            }
+            catch { }
+        }
+
         public static string GetActiveDocumentSummary()
         {
             return PsContext.Current.Run<string>(delegate
@@ -1426,6 +1457,658 @@ namespace TxTools.Agent.Ps
             var mi = t.GetMethod(name, Type.EmptyTypes);
             if (mi != null) return mi.Invoke(obj, null);
             return null;
+        }
+
+        // ───────── CEE 内部逻辑控制（Logic Block / SCL / Modules Viewer）─────────
+        //
+        // 区分 External PLC 连接 vs CEE 内部逻辑：
+        //   External PLC: 信号有 I/O 地址(I1.0/Q1.0), 通过 OPC/ExternalConnection 与外部 PLC 通信
+        //   CEE 内部逻辑: 信号无地址需求, 连接 LB Entry/Exit, 由 Modules Viewer 层级调度
+        //
+        // API 路径:
+        //   TxDocument.PlcProgramRoot.CurrentPlcProgram → TxPlcProgram (ITxPlcSignalCreation)
+        //   资源 → ITxPlcLogicBehaviorCreation.CreateLogicBehavior() → Smart Component
+        //   资源 → ITxPlcSclCreation.CreateSclContainer() → SCL 文本编辑
+
+        /// <summary>获取当前 PLC 程序实例的 dynamic 引用（统一入口）。</summary>
+        private static dynamic GetCurrentPlcProgram()
+        {
+            try
+            {
+                dynamic doc = TxApplication.ActiveDocument;
+                if (doc == null) return null;
+                dynamic plcRoot = doc.PlcProgramRoot;
+                if (plcRoot == null) return null;
+                try { return plcRoot.CurrentPlcProgram; } catch { }
+                try { return plcRoot.CurrentPlcProgramOrNull; } catch { }
+                return null;
+            }
+            catch { return null; }
+        }
+
+        // ───────── 资源逻辑状态查询（只读）─────────
+
+        /// <summary>
+        /// 查询资源的完整 CEE 逻辑状态：HasPlcAspect、LogicBehavior、SclContainer、关联信号。
+        /// 只读，不修改场景。
+        /// </summary>
+        public static string GetResourceLogicStatus(string name)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = null;
+                    if (!string.IsNullOrWhiteSpace(name))
+                        obj = FindByName(name);
+                    else
+                        obj = FirstSelected();
+                    if (obj == null) return "未找到指定资源"
+                        + (string.IsNullOrWhiteSpace(name) ? "（当前无选中）。" : " '" + name + "'。");
+
+                    var sb = new StringBuilder();
+                    sb.AppendLine("=== 资源 CEE 逻辑状态 ===");
+                    sb.AppendLine("名称: " + SafeName(obj));
+                    sb.AppendLine("类型: " + obj.GetType().Name);
+
+                    // HasPlcAspect
+                    bool hasAspect = false;
+                    try { dynamic d = obj; hasAspect = (bool)d.HasPlcAspect; } catch { }
+                    sb.AppendLine("PLC 层面: " + (hasAspect ? "已加载" : "✗ 未加载"));
+
+                    // LogicBehavior (ITxPlcLogicResource)
+                    try
+                    {
+                        dynamic d = obj;
+                        dynamic lb = d.LogicBehavior;
+                        if (lb != null)
+                        {
+                            sb.AppendLine("逻辑行为(LB): ✓ 已创建");
+                            try { int entries = 0, exits = 0, actions = 0, parameters = 0, constants = 0;
+                                foreach (dynamic e in lb)
+                                {
+                                    string tn = e.GetType().Name;
+                                    if (tn.Contains("Entry")) entries++;
+                                    else if (tn.Contains("Exit")) exits++;
+                                    else if (tn.Contains("Action")) actions++;
+                                    else if (tn.Contains("Parameter")) parameters++;
+                                    else if (tn.Contains("Constant")) constants++;
+                                }
+                                sb.Append("  Entry(输入):" + entries);
+                                if (exits > 0) sb.Append("  Exit(输出):" + exits);
+                                if (actions > 0) sb.Append("  Action(动作):" + actions);
+                                if (parameters > 0) sb.Append("  Parameter:" + parameters);
+                                if (constants > 0) sb.Append("  Constant:" + constants);
+                                sb.AppendLine();
+                            } catch { }
+                        }
+                        else sb.AppendLine("逻辑行为(LB): ✗ 未创建");
+                    }
+                    catch { sb.AppendLine("逻辑行为(LB): 不支持"); }
+
+                    // SclContainer (ITxPlcSclResource)
+                    try
+                    {
+                        dynamic d = obj;
+                        dynamic sc = d.SclContainer;
+                        if (sc != null)
+                        {
+                            sb.AppendLine("SCL 容器: ✓ 已创建");
+                            try
+                            {
+                                string prog = sc.MainProgramText as string;
+                                int lines = !string.IsNullOrEmpty(prog)
+                                    ? prog.Split(new[] { '\n' }, StringSplitOptions.None).Length : 0;
+                                sb.AppendLine("  SCL 代码行数: " + lines);
+                            }
+                            catch { }
+                        }
+                        else sb.AppendLine("SCL 容器: ✗ 未创建");
+                    }
+                    catch { sb.AppendLine("SCL 容器: 不支持"); }
+
+                    // 关联信号
+                    try
+                    {
+                        dynamic plcProg = GetCurrentPlcProgram();
+                        if (plcProg != null)
+                        {
+                            dynamic signals = plcProg.GetSignals();
+                            int cnt = 0;
+                            if (signals != null)
+                                foreach (dynamic s in signals)
+                                {
+                                    try
+                                    {
+                                        dynamic res = s.PlcResource;
+                                        if (res != null && string.Equals(SafeName(res), SafeName(obj),
+                                            StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            cnt++;
+                                            if (cnt == 1) sb.AppendLine("关联信号:");
+                                            sb.AppendLine("  " + SafeName(s) + " [" + s.GetType().Name + "]");
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            if (cnt == 0) sb.AppendLine("关联信号: 无");
+                        }
+                    }
+                    catch { sb.AppendLine("关联信号: 查询失败"); }
+
+                    return sb.ToString().TrimEnd();
+                }
+                catch (Exception ex) { return "查询资源逻辑状态失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 列出 PLC 程序中所有信号（CEE 内外部共用）。支持 nameFilter 过滤。
+        /// </summary>
+        public static string ListPlcSignals(string nameFilter)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    dynamic plcProg = GetCurrentPlcProgram();
+                    if (plcProg == null) return "当前文档没有定义 PLC 程序。";
+
+                    dynamic signals = plcProg.GetSignals();
+                    var sb = new StringBuilder();
+                    var list = new List<dynamic>();
+                    if (signals != null)
+                    {
+                        foreach (dynamic s in signals)
+                        {
+                            if (!string.IsNullOrWhiteSpace(nameFilter))
+                            {
+                                if (SafeName(s).IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                            }
+                            list.Add(s);
+                        }
+                    }
+                    if (list.Count == 0)
+                        return string.IsNullOrWhiteSpace(nameFilter) ? "PLC 程序中暂无信号。" : "未找到 '" + nameFilter + "'。";
+
+                    sb.AppendLine("=== 信号列表（共 " + list.Count + " 个）===");
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        dynamic s = list[i];
+                        string tn = s.GetType().Name;
+                        string addr = ""; try { addr = (string)s.Address ?? ""; } catch { }
+                        string dt = ""; try { dt = (string)s.DataType ?? ""; } catch { }
+                        string cmt = ""; try { cmt = (string)s.Comment ?? ""; } catch { }
+
+                        sb.Append((i + 1) + ". [" + tn + "] " + SafeName(s));
+                        if (!string.IsNullOrEmpty(addr)) sb.Append("  地址:" + addr + "  ");
+                        if (!string.IsNullOrEmpty(dt)) sb.Append(" 类型:" + dt);
+                        sb.AppendLine();
+                        if (!string.IsNullOrEmpty(cmt)) sb.AppendLine("    注释: " + cmt);
+                        bool hasAddr = !string.IsNullOrEmpty(addr);
+                        sb.AppendLine("    用途: " + (hasAddr ? "外部PLC" : "CEE内部"));
+                    }
+                    return sb.ToString().TrimEnd();
+                }
+                catch (Exception ex) { return "列出信号失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 列出所有 CEE 模块及其条目（Modules Viewer Hierarchy）。
+        /// </summary>
+        public static string ListCeeModules()
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    dynamic plcProg = GetCurrentPlcProgram();
+                    if (plcProg == null) return "当前文档没有定义 PLC 程序。";
+
+                    dynamic modules = plcProg.PlcModules;
+                    var sb = new StringBuilder();
+                    int count = 0;
+                    if (modules != null)
+                    {
+                        foreach (dynamic mod in modules)
+                        {
+                            count++;
+                            sb.AppendLine("模块: " + SafeName(mod));
+                            try
+                            {
+                                dynamic entries = mod.PlcEntries;
+                                if (entries != null)
+                                {
+                                    int ei = 0;
+                                    foreach (dynamic e in entries)
+                                    {
+                                        ei++;
+                                        sb.Append("  [" + ei + "] ");
+                                        try { sb.Append(e.GetType().Name + " "); } catch { }
+                                        sb.Append("ID:" + e.UniqueId);
+                                        sb.AppendLine();
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                    return count == 0 ? "暂无 CEE 模块。" : "=== CEE 模块列表（共 " + count + " 个）===\n" + sb.ToString().TrimEnd();
+                }
+                catch (Exception ex) { return "列出 CEE 模块失败: " + ex.Message; }
+            });
+        }
+
+        // ───────── 信号创建（通用，CEE 内外部均可用）─────────
+
+        /// <summary>创建 PLC 信号（input/output）。CEE 内部使用时 address 留空即可。</summary>
+        public static string CreatePlcSignal(string signalType, string name, string address,
+            string dataType, string comment)
+        {
+            return PsContext.Current.Run<string>(delegate
+                                                         {
+                                                             try
+                                                             {
+                                                                 dynamic plcProg = GetCurrentPlcProgram();
+                                                                 if (plcProg == null) return "当前文档没有定义 PLC 程序，无法创建信号。";
+                                                                 if (string.IsNullOrWhiteSpace(name)) return "信号名称不能为空。";
+                                                                 if (string.IsNullOrWhiteSpace(dataType)) dataType = "BOOL";
+
+                                                                 dynamic doc = TxApplication.ActiveDocument;
+                                                                 bool undo = BeginUndo(doc, "create_signal: " + name);
+                                                                 try
+                                                                 {
+                                                                     dynamic sig;
+                                                                     switch (signalType.ToLowerInvariant())
+                                                                     {
+                                                                         case "input":
+                                                                             {
+                                                                                 var d = new TxPlcInputSignalCreationData(); d.Name = name;
+                                                                                 SetPropertyFromString(d, "DataType", dataType);
+                                                                                 if (!string.IsNullOrWhiteSpace(address)) SetPropertyFromString(d, "Address", address);
+                                                                                 if (!string.IsNullOrWhiteSpace(comment)) d.Comment = comment;
+                                                                                 sig = plcProg.CreatePlcInputSignal(d);
+                                                                             }
+                                                                             break;
+                                                                         case "output":
+                                                                             {
+                                                                                 var d = new TxPlcOutputSignalCreationData(); d.Name = name;
+                                                                                 SetPropertyFromString(d, "DataType", dataType);
+                                                                                 if (!string.IsNullOrWhiteSpace(address)) SetPropertyFromString(d, "Address", address);
+                                                                                 if (!string.IsNullOrWhiteSpace(comment)) d.Comment = comment;
+                                                                                 sig = plcProg.CreatePlcOutputSignal(d);
+                                                                             }
+                                                                             break;
+                                                                         case "display":
+                                                                             {
+                                                                                 var d = new TxPlcDisplaySignalCreationData(); d.Name = name;
+                                                                                 SetPropertyFromString(d, "DataType", dataType);
+                                                                                 if (!string.IsNullOrWhiteSpace(comment)) d.Comment = comment;
+                                                                                 sig = plcProg.CreatePlcDisplaySignal(d);
+                                                                             }
+                                                                             break;
+                                                                         default:
+                                                                             return "不支持的信号类型 '" + signalType + "'。支持: input, output, display。";
+                                                                     }
+                                                                     string result = "已创建" + signalType + "信号: " + SafeName(sig) + "  类型:" + dataType
+                                                                         + (string.IsNullOrWhiteSpace(address) ? "" : "  地址:" + address);
+                                                                     if (undo) result += "\n可 Ctrl+Z 撤销。";
+                                                                     return result;
+                                                                 }
+                                                                 finally { if (undo) EndUndo(doc); }
+                                                             }
+                                                             catch (Exception ex) { return "创建信号失败: " + ex.Message; }
+                                                         });
+        }
+
+        // ───────── CEE 逻辑块操作（变更）─────────
+
+        /// <summary>
+        /// 为资源添加 CEE 逻辑行为（创建 Smart Component）。
+        /// 资源必须实现 ITxPlcLogicBehaviorCreation 接口。
+        /// </summary>
+        public static string AddLogicToResource(string name)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = string.IsNullOrWhiteSpace(name) ? FirstSelected() : FindByName(name);
+                    if (obj == null) return "未找到资源'" + (name ?? "(选中)") + "'。";
+
+                    dynamic doc = TxApplication.ActiveDocument;
+                    bool undo = BeginUndo(doc, "add_logic: " + SafeName(obj));
+                    try
+                    {
+                        dynamic d = obj;
+                        try { bool can = (bool)d.CanCreateLogicBehavior; if (!can) return "该资源不允许创建逻辑行为。"; }
+                        catch { return "该资源不支持逻辑行为（未实现 ITxPlcLogicBehaviorCreation）。"; }
+
+                        d.CreateLogicBehavior();
+                        string result = "已为资源 '" + SafeName(obj) + "' 创建逻辑行为（智能组件）。";
+                        if (undo) result += "\n可在 Resource Logic Behavior Editor 中编辑 Entries/Exits/Actions。可 Ctrl+Z 撤销。";
+                        return result;
+                    }
+                    finally { if (undo) EndUndo(doc); }
+                }
+                catch (Exception ex) { return "添加逻辑行为失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 为资源创建 SCL 容器，用于结构化文本编程。
+        /// 资源必须实现 ITxPlcSclCreation 接口。
+        /// </summary>
+        public static string CreateSclContainer(string name)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = string.IsNullOrWhiteSpace(name) ? FirstSelected() : FindByName(name);
+                    if (obj == null) return "未找到资源'" + (name ?? "(选中)") + "'。";
+
+                    dynamic doc = TxApplication.ActiveDocument;
+                    bool undo = BeginUndo(doc, "create_scl: " + SafeName(obj));
+                    try
+                    {
+                        dynamic d = obj;
+                        try { bool can = (bool)d.CanCreateSclContainer; if (!can) return "该资源不允许创建 SCL 容器。"; }
+                        catch { return "该资源不支持 SCL（未实现 ITxPlcSclCreation）。"; }
+
+                        d.CreateSclContainer();
+                        string result = "已为资源 '" + SafeName(obj) +"' 创建 SCL 容器。";
+                        if (undo) result += "\n可在 SCL Editor 中编写结构化文本逻辑。可 Ctrl+Z 撤销。";
+                        return result;
+                    }
+                    finally { if (undo) EndUndo(doc); }
+                }
+                catch (Exception ex) { return "创建 SCL 容器失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 将一个资源的逻辑复制到另一个同类资源。
+        /// 源必须已有 LogicBehavior，目标必须为空且同类型。
+        /// </summary>
+        public static string CopyLogic(string sourceName, string targetName)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject src = FindByName(sourceName);
+                    if (src == null) return "未找到源资源 '" + sourceName + "'。";
+                    ITxObject tgt = FindByName(targetName);
+                    if (tgt == null) return "未找到目标资源 '" + targetName + "'。";
+
+                    dynamic doc = TxApplication.ActiveDocument;
+                    bool undo = BeginUndo(doc, "copy_logic: " + sourceName + " → " + targetName);
+                    try
+                    {
+                        dynamic dSrc = src;
+                        try { dSrc.CopySelfLogicToOtherLogicResource((dynamic)tgt); }
+                        catch (Exception ex) { return "复制逻辑失败: " + ex.Message + "。目标资源可能已有逻辑或类型不兼容。"; }
+
+                        string result = "已将 '" + sourceName + "' 的逻辑行为复制到 '" + targetName + "'。";
+                        if (undo) result += "\n可 Ctrl+Z 撤销。";
+                        return result;
+                    }
+                    finally { if (undo) EndUndo(doc); }
+                }
+                catch (Exception ex) { return "复制逻辑失败: " + ex.Message; }
+            });
+        }
+
+        // ───────── CEE 模块操作（变更）─────────
+
+        /// <summary>
+        /// 创建 CEE 模块（Modules Viewer Hierarchy 中的模块）。
+        /// 模块用于编写信号表达式：ResultSignal = expression of signals。
+        /// </summary>
+        public static string CreateCeeModule(string name)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    dynamic plcProg = GetCurrentPlcProgram();
+                    if (plcProg == null) return "当前文档没有定义 PLC 程序，无法创建模块。";
+                    if (string.IsNullOrWhiteSpace(name)) return "模块名称不能为空。";
+
+                    dynamic doc = TxApplication.ActiveDocument;
+                    bool undo = BeginUndo(doc, "create_module: " + name);
+                    try
+                    {
+                        var data = new TxPlcModuleCreationData(name);
+                        dynamic mod = plcProg.CreateModule(data);
+                        string result = "已创建 CEE 模块: " + name;
+                        if (undo) result += "\n可在 Modules Viewer 中编辑信号表达式和 IF/ELSE 条件。可 Ctrl+Z 撤销。";
+                        return result;
+                    }
+                    finally { if (undo) EndUndo(doc); }
+                }
+                catch (Exception ex) { return "创建 CEE 模块失败: " + ex.Message; }
+            });
+        }
+
+        // ───────── 传感器创建（变更）─────────
+
+        /// <summary>
+        /// 在资源上创建光传感器。资源必须实现 ITxPlcSensorCreation。
+        /// 光传感器可检测物体遮挡，发出信号到 LB Entry。
+        /// </summary>
+        public static string CreatePlcSensor(string resourceName, string sensorType, string sensorName)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = string.IsNullOrWhiteSpace(resourceName)
+                        ? FirstSelected() : FindByName(resourceName);
+                    if (obj == null) return "未找到资源'" + (resourceName ?? "(选中)") + "'。";
+                    if (string.IsNullOrWhiteSpace(sensorName))
+                        sensorName = "Sensor_" + SafeName(obj);
+
+                    dynamic doc = TxApplication.ActiveDocument;
+                    bool undo = BeginUndo(doc, "create_sensor: " + sensorName);
+                    try
+                    {
+                        dynamic d = obj;
+                        try { bool can = (bool)d.CanCreatePlcLightSensor;
+                              if (!can) return "该资源不允许创建光传感器。"; }
+                        catch { return "该资源不支持传感器创建（未实现 ITxPlcSensorCreation）。"; }
+
+                        // TxPlcLightSensorCreationData 为 abstract，尝试多种具体子类
+                        dynamic sensorData = null;
+                        try { sensorData = Activator.CreateInstance(
+                            Type.GetType("Tecnomatix.Engineering.TxTcPlcLightSensorCreationData, Tecnomatix.Engineering")); }
+                        catch { }
+                        if (sensorData == null)
+                            try { sensorData = Activator.CreateInstance(
+                                Type.GetType("Tecnomatix.Engineering.TxEmsPlcLightSensorCreationData, Tecnomatix.Engineering")); }
+                            catch { }
+
+                        if (sensorData == null)
+                        {
+                            // 最后尝试用动态直接 new — 某些版本自动解析
+                            try
+                            {
+                                dynamic typeToCreate = Type.GetType("Tecnomatix.Engineering.TxTcPlcLightSensorCreationData");
+                                if (typeToCreate != null) sensorData = Activator.CreateInstance(typeToCreate);
+                            }
+                            catch { }
+                        }
+
+                        if (sensorData == null)
+                            return "无法创建光传感器创建数据：找不到 TxTcPlcLightSensorCreationData 或 TxEmsPlcLightSensorCreationData 类型。";
+
+                        sensorData.Name = sensorName;
+                        try { sensorData.CurrentRange = 300.0; } catch { }
+                        try { sensorData.MaxRange = 500.0; } catch { }
+
+                        dynamic sensor = d.CreatePlcLightSensor(sensorData);
+                        string result = "已创建光传感器: " + SafeName(sensor) + " (资源: " + SafeName(obj) + ")";
+                        if (undo) result += "\n可 Ctrl+Z 撤销。";
+                        return result;
+                    }
+                    finally { if (undo) EndUndo(doc); }
+                }
+                catch (Exception ex) { return "创建传感器失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 列出资源的 LogicBehavior 元素：Entries（入口）、Exits（出口）、
+        /// Actions（动作）、Parameters（参数）、Constants（常量）。
+        /// 只读。用于检查 LB 待连接的状态。
+        /// </summary>
+        public static string ListLogicBehaviorElements(string resourceName)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = string.IsNullOrWhiteSpace(resourceName)
+                        ? FirstSelected() : FindByName(resourceName);
+                    if (obj == null) return "未找到资源'" + (resourceName ?? "(选中)") + "'。";
+
+                    dynamic d = obj;
+                    dynamic lb = null;
+                    try { lb = d.LogicBehavior; } catch { }
+                    if (lb == null) return "该资源没有 LogicBehavior。请先调用 add_logic_to_resource 创建。";
+
+                    var sb = new StringBuilder();
+                    sb.AppendLine("=== LogicBehavior 元素: " + SafeName(obj) + " ===");
+                    int total = 0;
+
+                    string[] categories = { "Entry", "Exit", "Action", "Parameter", "Constant" };
+                    // 尝试多种枚举策略
+                    foreach (var cat in categories)
+                    {
+                        var group = new List<string>();
+                        // 策略1: 按接口名筛选
+                        try
+                        {
+                            foreach (dynamic el in lb)
+                            {
+                                string tn = el.GetType().Name;
+                                if (tn.Contains(cat))
+                                {
+                                    string elName = SafeName(el);
+                                    string detail = "";
+                                    try { dynamic sig = el.Signal; if (sig != null) detail = " → " + SafeName(sig); } catch { }
+                                    try { dynamic sig = el.ConnectedSignal; if (sig != null) detail = " → " + SafeName(sig); } catch { }
+                                    group.Add("  " + elName + " [" + tn + "]" + detail);
+                                    total++;
+                                }
+                            }
+                        }
+                        catch { }
+
+                        if (group.Count > 0)
+                        {
+                            sb.AppendLine("[" + cat + "] (" + group.Count + "个):");
+                            foreach (var g in group) sb.AppendLine(g);
+                        }
+                    }
+
+                    if (total == 0)
+                        sb.AppendLine("LB 中没有元素。请在 Resource Logic Behavior Editor 中创建 Entries/Exits。");
+                    else
+                        sb.Insert(23 + SafeName(obj).Length, "共 " + total + " 个元素\n");
+
+                    return sb.ToString().TrimEnd();
+                }
+                catch (Exception ex) { return "列出 LB 元素失败: " + ex.Message; }
+            });
+        }
+
+        /// <summary>
+        /// 将 PLC 信号连接到资源的 LogicBehavior Entry 或 Exit。
+        /// 使用多策略 dynamic 调用兜底 SDK 版本差异。
+        /// </summary>
+        public static string ConnectSignalToLB(string resourceName, string signalName,
+            string pinType, string pinName)
+        {
+            return PsContext.Current.Run<string>(delegate
+            {
+                try
+                {
+                    ITxObject obj = string.IsNullOrWhiteSpace(resourceName)
+                        ? FirstSelected() : FindByName(resourceName);
+                    if (obj == null) return "未找到资源'" + (resourceName ?? "(选中)") + "'。";
+
+                    // 获取 LB
+                    dynamic d = obj;
+                    dynamic lb = null;
+                    try { lb = d.LogicBehavior; } catch { }
+                    if (lb == null) return "该资源没有 LogicBehavior。";
+
+                    // 查找信号
+                    dynamic plcProg = GetCurrentPlcProgram();
+                    if (plcProg == null) return "PLC 程序未定义。";
+                    dynamic sig = null;
+                    dynamic signals = plcProg.GetSignals();
+                    if (signals != null)
+                    {
+                        foreach (dynamic s in signals)
+                        {
+                            if (string.Equals(SafeName(s), signalName, StringComparison.OrdinalIgnoreCase))
+                            { sig = s; break; }
+                        }
+                    }
+                    if (sig == null) return "未找到信号 '" + signalName + "'。";
+
+                    // 查找 LB 元素（Entry 或 Exit）
+                    dynamic targetEl = null;
+                    try
+                    {
+                        foreach (dynamic el in lb)
+                        {
+                            string tn = el.GetType().Name;
+                            if ((pinType == "entry" && tn.Contains("Entry"))
+                                || (pinType == "exit" && tn.Contains("Exit")))
+                            {
+                                if (string.IsNullOrWhiteSpace(pinName) ||
+                                    SafeName(el).IndexOf(pinName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                { targetEl = el; break; }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (targetEl == null)
+                        return "未找到 " + pinType + " 引脚'" + (pinName ?? "(任意)") + "'。请先用 PS 编辑器在 LB 中创建 " + pinType + "。";
+
+                    // 连接策略（多种 API 版本）
+                    bool connected = false;
+                    string errors = "";
+
+                    // 策略1: 设 LB 元素上的 Signal/ConnectedSignal 属性
+                    try { targetEl.Signal = sig; connected = true; } catch (Exception ex) { errors += "Signal=" + ex.Message + "; "; }
+                    if (!connected) try { targetEl.ConnectedSignal = sig; connected = true; } catch (Exception ex) { errors += "ConnectedSignal=" + ex.Message + "; "; }
+
+                    // 策略2: 设信号上的属性指向 LB 元素
+                    if (!connected) try { sig.LBEntry = targetEl; connected = true; } catch { }
+                    if (!connected) try { sig.LBExit = targetEl; connected = true; } catch { }
+
+                    // 策略3: LB 上的 Connect/Set/Bind 方法
+                    if (!connected) try { lb.ConnectEntryToSignal(targetEl, sig); connected = true; } catch { }
+                    if (!connected) try { lb.ConnectExitToSignal(targetEl, sig); connected = true; } catch { }
+                    if (!connected) try { lb.SetConnectedSignal(targetEl, sig); connected = true; } catch { }
+                    if (!connected) try { targetEl.Connect(sig); connected = true; } catch { }
+
+                    if (!connected)
+                        return "无法连接信号到 LB 引脚。失败的尝试: " + errors
+                            + "请在 PS Resource Logic Behavior Editor 中手动连接。";
+
+                    return "已将信号 '" + SafeName(sig) + "' 连接到 " + pinType + " '"
+                        + SafeName(targetEl) + "' (资源: " + SafeName(obj) + ")。";
+                }
+                catch (Exception ex) { return "连接信号到 LB 失败: " + ex.Message; }
+            });
         }
     }
 }

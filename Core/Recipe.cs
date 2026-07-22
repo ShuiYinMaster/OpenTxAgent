@@ -5,6 +5,7 @@
 // 那类逻辑由 agent 在对话里直接调用工具处理，配方只固化稳定可复用的步骤。
 
 using System.Collections.Generic;
+using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -30,5 +31,42 @@ namespace TxTools.Agent.Core
         [JsonProperty("description")] public string Description { get; set; }
         [JsonProperty("parameters")] public List<RecipeParam> Parameters { get; set; }
         [JsonProperty("steps")] public List<RecipeStep> Steps { get; set; }
+
+        // ── 工具名净化 ──────────────────────────────────────────
+        // LLM API 要求 function.name 匹配 ^[a-zA-Z0-9_-]+$。
+        // 配方 Name 允许中文(更友好)，通过本方法生成 API 安全的工具名。
+        // 规则:
+        //   1. 已是纯 ASCII 安全名 → 原样返回
+        //   2. 含非 ASCII 字符 → 尽量提取 ASCII 子串(中文间嵌入的英文/数字)
+        //   3. 提取后仍为空 → 用稳定哈希生成 recipe_xxxxxxxx 兜底名
+        // 内部使用，不持久化到 JSON (只存 Name 原文)。
+
+        public static string ToApiSafeName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "recipe_unknown";
+
+            // 已是纯 ASCII 安全名 → 不处理
+            if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-zA-Z0-9_-]+$"))
+                return name;
+
+            // 提取所有 ASCII 安全字符
+            var sb = new StringBuilder();
+            foreach (char c in name)
+            {
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '_' || c == '-')
+                    sb.Append(c);
+                else if (c == ' ')
+                    sb.Append('_');
+            }
+            var extracted = sb.ToString().Trim('_', '-');
+            if (extracted.Length >= 2) return extracted;
+
+            // 全部是非 ASCII 字符 → 稳定哈希兜底 (djb2, 跨 .NET 版本不变)
+            uint hash = 5381;
+            foreach (char c in name)
+                hash = ((hash << 5) + hash) + c;
+            return "recipe_" + hash.ToString("x8");
+        }
     }
 }

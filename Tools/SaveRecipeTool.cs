@@ -80,8 +80,16 @@ namespace TxTools.Agent.Tools
 
             if (recipe == null || string.IsNullOrWhiteSpace(recipe.Name))
                 return "配方缺少 name。";
+
+            // 自动净化 Name: LLM 可能会给中文名(不满足 API function.name ^[a-zA-Z0-9_-]+$),
+            // 用 ToApiSafeName 转成 API 安全名(提取 ASCII 子串或哈希兜底)。净化后通知 LLM 实际工具名。
+            var originalName = recipe.Name;
+            var safeName = Recipe.ToApiSafeName(recipe.Name);
+            if (!string.Equals(safeName, originalName, System.StringComparison.Ordinal))
+                recipe.Name = safeName;  // 持久化用安全名，避免下次启动再次净化
+
             if (!IsValidName(recipe.Name))
-                return "配方名只能含字母、数字、下划线、连字符。";
+                return "配方名净化后仍无效: \"" + originalName + "\" → \"" + safeName + "\"。请用英文/数字/下划线/连字符命名。";
             if (recipe.Steps == null || recipe.Steps.Count == 0)
                 return "配方至少要有一个步骤。";
 
@@ -108,8 +116,10 @@ namespace TxTools.Agent.Tools
 
             _registry.Register(new RecipeTool(recipe, _registry));
 
-            return "已保存配方 \"" + recipe.Name + "\"(" + recipe.Steps.Count + " 步)到 " + path +
-                   "，现在可直接调用。";
+            var nameNote = string.Equals(safeName, originalName, System.StringComparison.Ordinal)
+                ? "" : " (原始名 \"" + originalName + "\" 已净化)";
+            return "已保存配方 \"" + recipe.Name + "\"" + nameNote
+                   + "(" + recipe.Steps.Count + " 步)到 " + path + "，现在可直接调用。";
         }
 
         private static bool IsValidName(string s)

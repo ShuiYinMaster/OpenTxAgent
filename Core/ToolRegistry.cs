@@ -41,12 +41,19 @@ namespace TxTools.Agent.Core
             var list = new List<ToolDef>(_map.Count);
             foreach (var t in _map.Values)
             {
+                // 安全网: function.name 必须匹配 ^[a-zA-Z0-9_-]+$。
+                // RecipeTool.Name 已做过净化, 此处兜底处理任何漏网的非 ASCII 工具名。
+                var fnName = t.Name;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(fnName, @"^[a-zA-Z0-9_-]+$"))
+                {
+                    fnName = Recipe.ToApiSafeName(fnName);
+                }
                 list.Add(new ToolDef
                 {
                     Type = "function",
                     Function = new FunctionDef
                     {
-                        Name = t.Name,
+                        Name = fnName,
                         Description = t.Description,
                         Parameters = t.InputSchema
                     }

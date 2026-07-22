@@ -40,6 +40,12 @@ namespace TxTools.Agent.Core
                     case ".xlsx":
                         ParseXlsx(file);
                         break;
+                    case ".docx":
+                        ParseDocx(file);
+                        break;
+                    case ".pptx":
+                        ParsePptx(file);
+                        break;
                     case ".csv":
                     case ".tsv":
                         ParseDelimited(file);
@@ -139,6 +145,91 @@ namespace TxTools.Agent.Core
             return ',';
         }
 
+        // ── docx / pptx: 文本抽取(仅供 agent 读上传文件时理解内容) ──
+
+        private static void ParseDocx(UploadedFile f)
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                using (var doc = DocumentFormat.OpenXml.Packaging.WordprocessingDocument.Open(f.LocalPath, false))
+                {
+                    var body = doc.MainDocumentPart?.Document?.Body;
+                    if (body != null)
+                    {
+                        // 段落
+                        foreach (var p in body.Descendants<DocumentFormat.OpenXml.Wordprocessing.Paragraph>())
+                        {
+                            var line = p.InnerText;
+                            if (!string.IsNullOrWhiteSpace(line)) sb.AppendLine(line);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { f.ParseError = ex.Message; }
+
+            var full = sb.ToString();
+            f.RowCount = full.Split('\n').Length;
+            f.ColCount = 0;
+            f.SheetCount = 0;
+            f.ParsedSummary = "[docx] " + f.OriginalName + "  \u5171 " + f.RowCount + " \u884c\u6587\u672c\n\n"
+                + Truncate(full, 2000);
+        }
+
+        private static void ParsePptx(UploadedFile f)
+        {
+            var sb = new StringBuilder();
+            int slideCount = 0;
+            try
+            {
+                using (var pres = DocumentFormat.OpenXml.Packaging.PresentationDocument.Open(f.LocalPath, false))
+                {
+                    var presPart = pres.PresentationPart;
+                    if (presPart != null && presPart.SlideParts != null)
+                    {
+                        foreach (var slidePart in presPart.SlideParts)
+                        {
+                            slideCount++;
+                            sb.AppendLine("── Slide " + slideCount + " ──");
+                            // 抽全部 <a:t> 文本
+                            foreach (var t in slidePart.Slide.Descendants<DocumentFormat.OpenXml.Drawing.Text>())
+                            {
+                                var s = t.Text;
+                                if (!string.IsNullOrWhiteSpace(s)) sb.AppendLine(s);
+                            }
+                            // notes 也带上
+                            if (slidePart.NotesSlidePart != null)
+                            {
+                                var notes = new StringBuilder();
+                                foreach (var t in slidePart.NotesSlidePart.NotesSlide.Descendants<DocumentFormat.OpenXml.Drawing.Text>())
+                                    if (!string.IsNullOrWhiteSpace(t.Text)) notes.AppendLine(t.Text);
+                                if (notes.Length > 0)
+                                {
+                                    sb.AppendLine("[notes]");
+                                    sb.Append(notes.ToString());
+                                }
+                            }
+                            sb.AppendLine();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { f.ParseError = ex.Message; }
+
+            f.RowCount = 0;
+            f.ColCount = 0;
+            f.SheetCount = slideCount;
+            f.ParsedSummary = "[pptx] " + f.OriginalName + "  \u5171 " + slideCount + " \u5f20 slide\n\n"
+                + Truncate(sb.ToString(), 3000);
+        }
+
+        private static string Truncate(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            if (s.Length <= max) return s;
+            return s.Substring(0, max) + "\n... [截断,完整内容请用 read_uploaded_file 分片读]";
+        }
+
         /// <summary>轻量 CSV 解析:支持 quoted "..."、内嵌双引号 ""、字段内换行、CRLF/LF。</summary>
         private static List<List<string>> ParseCsvText(string text, char delim)
         {
@@ -207,7 +298,7 @@ namespace TxTools.Agent.Core
 
                 sb.AppendLine();
                 sb.AppendLine("预览:");
-                sb.AppendLine(TrimToMax(tok.ToString(Formatting.Indented), TextPreviewChars));
+                sb.AppendLine(TrimToMax(JsonConvert.SerializeObject(tok, Formatting.Indented), TextPreviewChars));
             }
             catch (Exception ex)
             {
