@@ -40,6 +40,17 @@ TxAgent/
     XlsxWriter.cs            xlsx 写出 (手写 Open XML, export_table 用)
     FileParserService.cs     按扩展名分发解析 xlsx/csv/tsv/txt/md/json/xml
 
+    ── LLM 提供商支持 ──
+    LlmProviders.cs          支持 DeepSeek / OpenAI / 兼容 API 的参数封装
+
+    ── 用户偏好 ──
+    UserPrefsStore.cs        用户设置持久化 (userprefs.json)
+
+    ── 补充工具基础 ──
+    ToolInputHelpers.cs      工具参数解析助手
+    MemoryTools.cs           记忆系统的工具实现 (搜索/存储/导出)
+    UploadTools.cs           文件上传相关工具实现
+
   UI/
     TxAgentForm.cs           WebView2 壳 (500 行, JS↔C# 消息路由)
     chat.html                完整 UI (顶栏/消息/输入/附件/抽屉/modal, 内置简易 Markdown)
@@ -47,7 +58,71 @@ TxAgent/
     ConversationListDialog.cs 原生历史对话弹窗 (v3 起 form 不再引用, 保留兜底)
     CodeApprovalDialog.cs    run_csharp 代码审阅框 (v3 仍在用)
 
-  Tools/                     具体工具实现 (见"工具清单"章节)
+  Tools/                     具体工具实现 (按功能域分组)
+    ── 场景查询 ──
+    SceneQueryTool.cs        查询当前文档/选中对象
+    SceneTreeTools.cs        list_children / count_objects 等遍历工具
+    
+    ── 对象查找与选择 ──
+    BatchTools.cs            find_objects(搜索) / batch_rename(批量重命名)
+    ActionTools.cs           select_objects / export_points_excel / export_object_list
+
+    ── 机器人工具 ──
+    RobotTools.cs            check_robot_base / inspect_robot_kinematics / find_robot_for_op
+
+    ── 位置与坐标 ──
+    LocationTools.cs         get_object_location / set_object_location / scan_devices_z / align_devices_z
+
+    ── 碰撞检测 ──
+    CollisionTools.cs        query_collision_sets / 碰撞分析工具
+
+    ── 仿真控制 ──
+    SimulationTools.cs       simulate_operation (播放/暂停/停止)
+
+    ── 操作工具 ──
+    OperationTools.cs        list_operations / count_points / list_tcp_options
+
+    ── API 反射探查 ──
+    ApiTools.cs              list_types / inspect_type / inspect_object
+
+    ── 代码执行 ──
+    RunCSharpTool.cs         run_csharp (兜底工具,写 C# 代码在 PS 内执行)
+
+    ── 导出工具 ──
+    ExportTableTool.cs       export_table (导出 Excel)
+    DocxExportTool.cs        export_docx (导出 Word 文档)
+
+    ── 配方管理 ──
+    SaveRecipeTool.cs        save_recipe (保存配方)
+    ListRecipesTool.cs       list_recipes (列配方)
+    DeleteRecipeTool.cs      delete_recipe (删除配方)
+
+    ── 代码片段 ──
+    SnippetTools.cs          save_snippet / list_snippets / get_snippet / find_snippet
+
+    ── CEE/PLC 逻辑控制 ──
+    PlcTools.cs              CEE 内部逻辑工具集:
+                               - get_resource_logic_status(查询资源 LB/SCL 状态)
+                               - list_cee_signals(列信号,区分 CEE 内外)
+                               - list_cee_modules(列 Modules 层级)
+                               - create_cee_signal(创建信号)
+                               - add_logic_to_resource(为资源添加 LB)
+                               - create_scl_container(创建 SCL 容器)
+                               - create_cee_module(创建 CEE 模块)
+                               - create_lb_sensor(创建光传感器)
+                               - list_lb_elements(列 LB 元素)
+                               - connect_signal_to_lb(连接信号到 LB)
+                               - copy_logic(复制逻辑)
+
+    ── 计划/待办 ──
+    UpdatePlanTool.cs        update_plan (维护多步任务清单)
+
+    ── 子目录 ──
+    Ps/                      PS SDK 通用桥接 (PsBridge.cs)
+    Catia/                   CATIA 集成工具 (可选)
+    Docs/                    工具文档生成
+
+  libs/                      手工引用的 NuGet 包 (Newtonsoft.Json 等)
 ```
 
 ## 依赖与引用
@@ -67,17 +142,17 @@ TxAgent/
 
 ## UI 架构 (v3)
 
-**主窗口就是一个填满的 WebView2 控件**，其余全部在 `chat.html` 里：顶栏（品牌名 + 模型下拉 + **审批模式下拉** + 新对话/历史/工具/萃取/Key 按钮）、消息区（Markdown 渲染 + 工具卡片折叠 + 表格支持）、输入区（附件卡片 + textarea + 上传/发送/停止）、状态栏（左状态 · 右 token 计数）、三个 modal（历史对话抽屉 · 工具面板 · API Key 输入）。
+**主窗口就是一个填满的 WebView2 控件**，其余全部在 `chat.html` 里：顶栏（品牌名 + 模型下拉 + **审批模式下拉** + 新对话/历史/工具/萃取/Key 按钮）、消息区、输入框、附件区、抽屉菜单、审批弹窗。
 
-**chat.html 部署方式**：作为**嵌入资源** (`Build Action = EmbeddedResource`) 打包进 dll，不再依赖 bin 目录物理复制。加载走 `WebResourceRequested` 拦截 `https://chathtml/*` 返回嵌入字节，页面 URL 保持 `chat.html` 便于 F12 调试报错定位。文件带 UTF-8 BOM 强制 Chromium 按 UTF-8 解析，绕开 Windows 中文系统的编码坑。
+**chat.html 部署方式**：作为**嵌入资源** (`Build Action = EmbeddedResource`) 打包进 dll，不再依赖 bin 目录物理复制。加载走 `WebResourceRequested` 拦截 `https://chath[...]` 虚拟域名。
 
 **通信协议 v2**：
 - JS → C#：`jsReady / setApiKey / switchModel / setApprovalMode / userSend / userStop / newConv / listConvs / openConv / deleteConv / listTools / uploadFile / removeAttachment / extractLessons`
 - C# → JS：`modelList / keyReady / askApiKey / convList / toolList / clear / restore / message / delta / closeAssistant / toolCall / toolResult / status / busy / tokenUsage / attachmentInfo`
 
-**审批弹窗保留原生**：`ApprovalRequest` 委托签名同步 `bool`，改成异步会牵连 AgentLoop 深层重构；原生 `CodeApprovalDialog` / `MessageBox` 自带消息 pump，不阻塞主循环。
+**审批弹窗保留原生**：`ApprovalRequest` 委托签名同步 `bool`，改成异步会牵连 AgentLoop 深层重构；原生 `CodeApprovalDialog` / `MessageBox` 自带消息 pump，不阻塞[...]
 
-**关键线程坑**：所有对 `CoreWebView2` 的属性访问（包括 `== null` 判断）必须在 UI 线程。`AgentLoop.SendAsync` 在 `Task.Run` 里跑，事件回调（delta/toolCall/…）在线程池触发；`PostJs` 必须先 `BeginInvoke` marshal 到 UI 线程再摸 `CoreWebView2`，否则抛 "CoreWebView2 can only be accessed from the UI thread"。
+**关键线程坑**：所有对 `CoreWebView2` 的属性访问（包括 `== null` 判断）必须在 UI 线程。`AgentLoop.SendAsync` 在 `Task.Run` 里跑，事件回调（delta/toolCall/…）[...]
 
 ## API Key
 
@@ -103,17 +178,17 @@ TxAgent/
 | **审批·半自动** | `auto_safe` | `run_csharp` 仍弹代码审阅框，其他变更工具自动通过 |
 | **审批·全自动** | `auto_all` | 所有变更工具（含 `run_csharp`）自动通过；切换时前端弹 confirm 二次确认 |
 
-**永久白名单**（`AgentOptions.AutoApproveTools`）与模式独立：`add_fact` / `add_gotcha_correction` 只写自家 json 库不动 PS 场景，任何模式下都直接通过，`AuditLog` 记 `AUTO-OK`。
+**永久白名单**（`AgentOptions.AutoApproveTools`）与模式独立：`add_fact` / `add_gotcha_correction` 只写自家 json 库不动 PS 场景，任何模式下都直接通过，`AuditLog` [...]
 
-**AuditLog 完整覆盖**：所有变更类工具的每次审批/执行都写一行 `audit.log`——`APPLIED` / `FAILED` / `DENIED` / `AUTO-OK` / `AUTO-SAFE` / `AUTO-ALL` / `APPROVAL-MODE = xxx`，可追溯。
+**AuditLog 完整覆盖**：所有变更类工具的每次审批/执行都写一行 `audit.log`——`APPLIED` / `FAILED` / `DENIED` / `AUTO-OK` / `AUTO-SAFE` / `AUTO-ALL` / `APPROVAL-MODE = xxx`[...]
 
 ## 线程模型（关键，别踩坑）
 
-`AgentLoop.SendAsync` 内部 `await` 网络 I/O 时**没用 `ConfigureAwait(false)`**，续延回 UI 同步上下文——于是 `tool.Execute(...)` 天然在 UI 主线程运行，可安全调用 PS SDK。**切勿在工具内另起线程去碰 PS 对象**。
+`AgentLoop.SendAsync` 内部 `await` 网络 I/O 时**没用 `ConfigureAwait(false)`**，续延回 UI 同步上下文——于是 `tool.Execute(...)` 天然在 UI 主线程运行，可安全调用[...]
 
-`TxAgentForm.HandleUserSendAsync` 里 `await Task.Run(() => _loop.SendAsync(...))` 把整个 agent 循环丢到线程池，UI 线程保持响应"停止"按钮，PS 界面不冻。工具执行内部若需调 PS SDK，通过 `PsContext.Run(Action)` 同步路由回主线程（`SynchronizationContext.Send`）。
+`TxAgentForm.HandleUserSendAsync` 里 `await Task.Run(() => _loop.SendAsync(...))` 把整个 agent 循环丢到线程池，UI 线程保持响应"停止"按钮，PS 界面不冻。工具执行内[...]
 
-**固有限制**：单个重操作（如遍历所有机器人）在主线程执行时，PS 必然短暂无响应——原生命令也一样。所以系统提示要求 `run_csharp` 写**有界代码**、大批量**分批并 log 进度**；审批框也提示"执行期 PS 会无响应"。真遇到生成代码里的死循环，只能结束 PS 进程，**批准前务必读一遍代码**是最后防线。
+**固有限制**：单个重操作（如遍历所有机器人）在主线程执行时，PS 必然短暂无响应——原生命令也一样。所以系统提示要求 `run_csharp` 写**有界代[...]
 
 ## DeepSeek 工具调用回合结构
 
@@ -122,7 +197,7 @@ TxAgent/
 3. 把该 assistant 消息**原样**追加回去（含 tool_calls），再为每次调用追加一条 `role:"tool"` 消息（带 `tool_call_id` + 结果文本）
 4. 再次请求，直到模型不再返回 tool_calls
 
-流式：`DeepSeekClient.SendStreamAsync` 解析 SSE，边收边把文本分片回调 `AssistantDelta`，并增量累积 `tool_calls` 分片；前端开一行【助手】→追加分片→工具调用或回合结束时闭行。
+流式：`DeepSeekClient.SendStreamAsync` 解析 SSE，边收边把文本分片回调 `AssistantDelta`，并增量累积 `tool_calls` 分片；前端开一行【助手】→追加分片→工具[...]
 
 ## 记忆系统 (三层)
 
@@ -131,14 +206,14 @@ TxAgent/
 `ConversationStore` 每条对话存成 `conversations/{id}.json`（含标题/时间/messages）。
 - 每轮 `HistoryChanged` 触发 `SaveCurrent`，写回当前对话文件（空对话不落盘）
 - 开窗时加载**最近一条**继续；顶部"新对话" = 存好当前 + 开新的；"历史"抽屉可打开/删除任意过往
-- **删除当前对话的坑**已修：删的若是 `_current`，立即清空并 `StartFreshConversation()`，否则下次切换时 `SaveCurrent()` 会把 `_current` 原地写回，出现"删了又出现"
+- **删除当前对话的坑**已修：删的若是 `_current`，立即清空并 `StartFreshConversation()`，否则下次切换时 `SaveCurrent()` 会把 `_current` 原地写回，出现"删了[...]
 - `AgentLoop._messages` 每轮压缩（保留最近 `MaxTurnsToKeep=3` 个 user 回合，其余提炼成摘要），`_fullHistory` 全量保留供持久化和萃取
 
 ### 2. 方法记忆 —— 代码片段
 
 `SnippetStore` 把摸索出的可用 `run_csharp` 代码持久化到 `snippets.json`。
 - **AutoSnippet**：`run_csharp` 成功后自动存（带 `auto_` 前缀 + 语义标签 + `HasSimilarCode` Jaccard 去重）
-- **按需注入 (v2 关键改动)**：每轮 `SendAsync` 前根据用户消息即时召回 Top-3 相关片段（含**完整代码**），作为独立 system 消息插入本轮工作记忆，轮末 `finally` 里移除。命中就直接引用/改写，不用再调 `find_snippet` 二次拉取
+- **按需注入 (v2 关键改动)**：每轮 `SendAsync` 前根据用户消息即时召回 Top-3 相关片段（含**完整代码**），作为独立 system 消息插入本轮工作记忆，轮[...]
 - `find_snippet` / `get_snippet` / `save_snippet` 手动接口保留
 
 ### 3. 语义记忆 —— 事实 + 踩坑
@@ -150,7 +225,7 @@ TxAgent/
 
 **GotchasStore**（`gotchas.json`）：`run_csharp` 报错的反面教材。
 - **AutoGotcha**：`RunOneTool` 里 `run_csharp` 输出含 CS0xxx/TxNotImplementedException 等特征时自动 `Record`
-- **精准签名 (v3 关键改动)**：`ExtractSignature` 用专用正则识别 CS1061/CS0117/CS0246 的"XX 不包含 YY 的定义"消息，从引号内抠出真正的 `Type.Member`，覆盖 6 种引号变体（U+0022/U+0027/U+201C/U+201D/U+2018/U+2019）。同时黑名单跳过 `Tecnomatix.Engineering` / `System.*` 等命名空间前缀。避免"所有 CS1061 归到同一个笼统签名"的痛点
+- **精准签名 (v3 关键改动)**：`ExtractSignature` 用专用正则识别 CS1061/CS0117/CS0246 的"XX 不包含 YY 的定义"消息，从引号内抠出真正的 `Type.Member`，覆盖 6 [...]
 - 系统提示注入 Top-15，`{Type.Member → 正解}` 精确到 API
 - AI 学到解法后应主动调 `add_gotcha_correction` 补 `Correction`
 
@@ -171,7 +246,7 @@ TxAgent/
 5. 用户发送时，C# 把附件摘要拼到用户消息前缀，AI 直接看到即可判断能否答
 
 **支持格式**：`.xlsx / .csv / .tsv / .txt / .md / .log / .json / .xml`。
-- **xlsx**：基于 **DocumentFormat.OpenXml SDK**（不再是自己手写的 XmlReader），正确处理 SharedString / InlineString / Boolean / 命名空间前缀（如 `x:sheet`）等所有边界
+- **xlsx**：基于 **DocumentFormat.OpenXml SDK**（不再是自己手写的 XmlReader），正确处理 SharedString / InlineString / Boolean / 命名空间前缀（如 `x:sheet`）等所有边[...]
 - **csv/tsv**：自动检测分隔符（`, ; \t` 频次统计），支持 quoted "..." + 双引号转义
 - **文本类**：UTF-8 优先，失败回退 GBK
 
@@ -194,7 +269,7 @@ TxAgent/
   - `inspect_type(type_name)` 反射列出某类型的公共属性/方法/事件签名
   - `inspect_object(name?)` 探查活动对象的运行时类型与各属性取值
 
-- **自写代码**：`run_csharp(code)` 用 .NET 自带 CodeDom 在 **PS 进程内**编译执行。代码作为方法体注入（已 `using Tecnomatix.Engineering`，可用 `TxApplication.ActiveDocument`、`log("…")`、`return` 结果）。
+- **自写代码**：`run_csharp(code)` 用 .NET 自带 CodeDom 在 **PS 进程内**编译执行。代码作为方法体注入（已 `using Tecnomatix.Engineering`，可用 `TxApplication.ActiveD[...]
 
   **安全门控**：
   - `run_csharp` 是变更工具，`ask` / `auto_safe` 模式下每次强制审批，`CodeApprovalDialog` 展示完整代码供审阅
@@ -213,9 +288,9 @@ TxAgent/
 1. agent 用现有工具跑通一个多步任务
 2. `save_recipe(name, description, parameters, steps)`，`steps[].tool` 必须是已存在的工具名，`steps[].input` 模板里用 `{{参数名}}` 引用 `parameters`
 3. 保存校验步骤工具都存在 → 写入 `recipes.json` → **即时注册成新工具**
-4. 启动时 `RecipeStore.Load()` 把已存配方注册回来；`list_recipes` 查、`delete_recipe(name)` 删
+4. 启动时 `RecipeStore.Load()` 把已保存配方注册回来；`list_recipes` 查、`delete_recipe(name)` 删
 
-**安全**：`IsReadOnly` 按步骤继承——全只读免审批；任一步会改场景则整条配方执行前一次性确认，内部步骤不二次弹窗。`save_recipe` 本身只读，但不允许用配方名遮蔽内置原语；配方间递归有 8 层深度上限。
+**安全**：`IsReadOnly` 按步骤继承——全只读免审批；任一步会改场景则整条配方执行前一次性确认，内部步骤不二次弹窗。`save_recipe` 本身只读，但[...]
 
 **局限**（有意）：只支持"参数化的固定序列"，无分支/循环/条件——那类逻辑由 agent 在对话里直接编排工具。
 
@@ -229,38 +304,129 @@ TxAgent/
 
 ## 工具清单
 
-**只读原语**：
-- 场景：`query_scene` / `count_objects` / `list_children` / `list_operations` / `count_points` / `list_tcp_options` / `check_reachability` / `get_reference_frame` / `find_objects`
-- 反射探查：`list_types` / `inspect_type` / `inspect_object`
-- 机器人：`check_robot_base` / `inspect_robot_kinematics` / `find_robot_for_op`
-- 位姿：`get_object_location` / `scan_devices_z`
-- 碰撞：`query_collision_sets`
+### 只读原语
 
-**变更原语**（需审批 / 可 Ctrl+Z 撤销）：
-- 位置：`set_object_location` / `align_devices_z`
-- 命名：`batch_rename`（prefix_replace / suffix_replace / regex_replace 三模式）
-- 仿真：`simulate_operation`
-- 选中：`select_objects`
-- 兜底：`run_csharp`（专属代码审阅框）
+**场景查询**：
+- `query_scene` —— 查询当前文档/选中对象基本信息
+- `count_objects` —— 全场景按类型统计/枚举对象
+- `list_children` —— 展开组件树子对象（如数 CD_L 下设备）
+- `list_operations` —— 列出选中操作及其属性
+- `count_points` —— 按类型统计点数（焊点/路径点等）
+- `list_tcp_options` —— 操作的 TCP 选项
+- `check_reachability` —— 快速可达性摘要
+- `get_reference_frame` —— 当前参考坐标系
+- `find_objects` —— 按名称/类型关键字搜索对象列表
 
-**导出**：`export_table` / `export_points_excel` / `export_object_list`
+**反射探查**：
+- `list_types(keyword)` —— 在程序集中搜类型
+- `inspect_type(type_name)` —— 列类型的公共成员
+- `inspect_object(name?)` —— 探查对象的运行时属性
 
-**记忆系统工具**：
-- 片段：`save_snippet` / `list_snippets` / `get_snippet` / `find_snippet`
-- 事实：`add_fact`（自动通过） / `list_facts`
-- 踩坑：`add_gotcha_correction`（自动通过） / `list_gotchas`
-- 跨对话：`search_past_conversations`
+**机器人**：
+- `check_robot_base` —— BASE0 偏差校验
+- `inspect_robot_kinematics` —— 运动学信息（关节/TCP）
+- `find_robot_for_op` —— 查找操作绑定的机器人
 
-**上传解析**：`list_uploaded_files` / `read_uploaded_file`
+**位姿**：
+- `get_object_location` —— 查询对象位置/姿态（XYZ + RPY）
+- `scan_devices_z` —— 扫描设备 Z 向落地状态
 
-**任务/配方**：`update_plan` / `list_recipes` / `save_recipe` / `delete_recipe`
+**碰撞**：
+- `query_collision_sets` —— 查碰撞检测组配置
+
+**CEE/PLC 逻辑（只读部分）**：
+- `get_resource_logic_status(name)` —— 查资源 LB/SCL 状态
+- `list_cee_signals(name_filter?)` —— 列信号，区分 CEE 内外
+- `list_cee_modules()` —— 列 Modules 层级
+- `list_lb_elements(resource_name)` —— 列 LB 元素（Entry/Exit/Action）
+
+### 变更原语（需审批 / 可 Ctrl+Z 撤销）
+
+**位置**：
+- `set_object_location(name, x, y, z, rx, ry, rz)` —— 设置对象位置/姿态
+- `align_devices_z(names, z_value)` —— Z 向对齐设备
+
+**命名**：
+- `batch_rename(names, mode, old_str, new_str)` —— 批量重命名
+  - `mode`: `prefix_replace` / `suffix_replace` / `regex_replace`
+
+**仿真**：
+- `simulate_operation(name, action)` —— 播放/暂停/停止/重置仿真
+  - `action`: `play` / `pause` / `stop` / `reset`
+
+**选中**：
+- `select_objects(names)` —— 按名称选中对象（替换原选择）
+
+**CEE/PLC 逻辑（变更部分）**：
+- `add_logic_to_resource(name)` —— 为资源添加 LogicBehavior（Smart Component）
+- `create_scl_container(name)` —— 为资源创建 SCL 编程容器
+- `create_cee_signal(signal_type, name, address?, data_type?, comment?)` —— 创建信号
+  - `signal_type`: `input` / `output` / `display`
+- `create_cee_module(name)` —— 创建 CEE 模块（Modules Viewer 层级）
+- `create_lb_sensor(resource_name?, sensor_name)` —— 在资源上创建光传感器
+- `connect_signal_to_lb(resource_name?, signal_name, pin_type, pin_name?)` —— 连接信号到 LB
+  - `pin_type`: `entry` / `exit`
+- `copy_logic(source_name, target_name)` —— 复制逻辑到同类资源
+
+**任务计划**：
+- `update_plan(items)` —— 维护多步待办清单（整表替换）
+
+**兜底**：
+- `run_csharp(code)` —— 写 C# 在 PS 内执行（专属代码审阅框）
+
+### 导出工具
+
+- `export_table(data, filename?)` —— 导出 Excel 汇总表
+- `export_points_excel(point_type?, use_mfg_name?, folder?)` —— 焊点/路径点坐标导出
+  - `point_type`: `WeldPoint` / `PathPoint` / `ContinuousPoint` / `All`
+- `export_object_list(type_keyword?, folder?)` —— 对象清单导出（机器人/设备等）
+
+### 记忆系统工具
+
+**代码片段**：
+- `save_snippet(name, code, description?, tags?)` —— 存代码片段
+- `list_snippets()` —— 列片段库
+- `get_snippet(name)` —— 取片段代码（+复用计数）
+- `find_snippet(keyword)` —— 按语义搜片段
+
+**事实与偏好**：
+- `add_fact(category, content)` —— 存事实（自动通过，不改场景）
+  - `category`: `preference` / `scene_constant` / `api_fact` / `workflow` / `misc`
+- `list_facts()` —— 列事实库
+
+**踩坑清单**：
+- `add_gotcha_correction(signature, correction)` —— 补踩坑正解（自动通过）
+- `list_gotchas()` —— 列踩坑清单
+
+**跨对话搜索**：
+- `search_past_conversations(keyword)` —— 跨对话按关键字搜历史消息
+
+### 上传解析
+
+- `list_uploaded_files()` —— 列当前对话的附件
+- `read_uploaded_file(file_id, sheet?, row_from?, row_to?, char_from?, char_to?)` —— 精读大文件（分片读，单次 12000 字符上限）
+
+### 配方管理
+
+- `list_recipes()` —— 列已保存配方
+- `save_recipe(name, description, parameters, steps)` —— 保存配方
+  - `steps[i]`: `{ "tool": "...", "input": { "param1": "{{param1}}", ... } }`
+- `delete_recipe(name)` —— 删除配方
 
 ## 加一个工具
 
 1. 在 `Tools/` 下实现 `ITxAgentTool`（或继承 `TxAgentToolBase`）：`Name` / `Description` / `IsReadOnly` / `InputSchema` / `Execute`。工具名限 a-z A-Z 0-9 `_` `-`，最长 64
 2. PS 实际调用直接用 `Tecnomatix.Engineering` API；如需路由到主线程，用 `PsContext.Current.Run(...)`
-3. `TxAgentCommand.BuildToolRegistry()` 里 `reg.Register(new YourTool())`
+3. `TxAgentCommand.BuildToolRegistry()` 里 `reg.Register(new YourTool())`，或让自动反射扫描（需公共无参构造）
 4. 需要拿当前 convId 的工具（如 AddFactTool），构造函数注入 `() => AgentLoop.Current?.CurrentConvId`
+
+## 自动工具注册
+
+TxAgentCommand 的 `AutoRegisterTools` 方法会自动扫描程序集中所有实现 `ITxAgentTool` 且有**公共无参构造**的类，自动补注册。
+
+- 新加工具只要有默认构造函数，扔进 `Tools/` 文件夹即可生效
+- 需依赖注入的工具（如 `SaveRecipeTool(reg)` / `AddFactTool(convIdSupplier)` / `RecipeTool(recipe,reg)`）继续手工注册，因无参构造会被自动扫描自然忽略
+- 同名已注册工具会被跳过，上面手工注册的优先级更高
 
 ## 目录与持久化
 
@@ -271,9 +437,10 @@ TxAgent/
 | `{插件目录}\recipes.json` | 已保存配方 |
 | `{插件目录}\snippets.json` | 代码片段库 |
 | `{插件目录}\facts.json` | 跨对话事实/偏好 |
-| `{插件目录}\gotchas.json` | 踩坑清单 |
-| `{插件目录}\audit.log` | 变更操作审计 |
-| `%TEMP%\TxTools.Agent\uploads\{convId}\` | 上传附件（关窗清理） |
+| `{插件目录}\gotchas.json` | 踩坑清单（含正解） |
+| `{插件目录}\audit.log` | 变更操作审计日志 |
+| `{插件目录}\userprefs.json` | 用户设置（模型、审批模式等） |
+| `%TEMP%\TxTools.Agent\uploads\{convId}\` | 上传附件临时目录（关窗清理） |
 
 插件目录不可写时（如部署在 `Program Files`），自动回退到 `%LOCALAPPDATA%\TxTools.Agent\`。
 
