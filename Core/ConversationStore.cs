@@ -93,6 +93,10 @@ namespace TxTools.Agent.Core
                     JsonConvert.SerializeObject(conv, Formatting.Indented), Encoding.UTF8);
             }
             catch { /* 持久化失败不影响对话本身 */ }
+
+            // JSON 是给 API 无损重放用的;MD 摘要是给检索用的。两者一起更新。
+            // 索引失败不抛 —— 它只是加速层。
+            ConversationIndex.Rebuild(conv);
         }
 
         public static void Delete(string id)
@@ -104,6 +108,7 @@ namespace TxTools.Agent.Core
                 if (File.Exists(p)) File.Delete(p);
             }
             catch { }
+            ConversationIndex.Delete(id);
         }
 
         /// <summary>是否含有至少一条用户消息(用于判断空对话不必落盘)。</summary>
@@ -149,6 +154,9 @@ namespace TxTools.Agent.Core
             }
             catch { }
         }
+
+        /// <summary>供 ConversationIndex 定位 index 子目录。</summary>
+        public static string FolderPathPublic() { return FolderPath(); }
 
         private static string FolderPath()
         {

@@ -21,6 +21,18 @@ namespace TxTools.Agent.Core
         [JsonProperty("max_tokens")] public int MaxTokens { get; set; }
         [JsonProperty("temperature")] public double? Temperature { get; set; }
         [JsonProperty("stream")] public bool Stream { get; set; }
+
+        /// <summary>
+        /// 流式时要求 API 在末尾 chunk 带回 usage。不设置的话 DeepSeek 流式不返回 token 用量。
+        /// 部分 provider 不认这个字段,DeepSeekClient 会在 400 时自动去掉重试。
+        /// </summary>
+        [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
+        public StreamOptions StreamOptions { get; set; }
+    }
+
+    public sealed class StreamOptions
+    {
+        [JsonProperty("include_usage")] public bool IncludeUsage { get; set; }
     }
 
     /// <summary>
@@ -34,6 +46,16 @@ namespace TxTools.Agent.Core
 
         [JsonProperty("content", NullValueHandling = NullValueHandling.Ignore)]
         public string Content { get; set; }
+
+        /// <summary>
+        /// 推理模型返回的思考内容(DeepSeek reasoner 系列的 reasoning_content)。普通模型为 null。
+        /// 只读不写:API 明确要求不能把 reasoning_content 回传到下一轮请求里,
+        /// 故用 ShouldSerialize 恒 false 屏蔽序列化 —— 反序列化仍正常填充。
+        /// </summary>
+        [JsonProperty("reasoning_content", NullValueHandling = NullValueHandling.Ignore)]
+        public string ReasoningContent { get; set; }
+
+        public bool ShouldSerializeReasoningContent() { return false; }
 
         [JsonProperty("tool_calls", NullValueHandling = NullValueHandling.Ignore)]
         public List<ToolCall> ToolCalls { get; set; }

@@ -1,7 +1,7 @@
 // TxTools.Agent / Core / SnippetStore.cs
 // 代码片段库：把摸索出的可用 run_csharp 代码持久化到 snippets.json，跨对话检索复用。
 // 这是给 codegen 路径的"方法记忆"——摸清一次 API、存下可用代码，以后先查库、命中就直接用。
-// 路径策略与 RecipeStore/KeyStore 一致(优先插件目录，回退 LocalAppData)。
+// 存储:memory/snippets/*.md,一条一文件(见 MdStore)。首次访问自动从 snippets.json 迁移。
 //
 // v2 增强：Tags(语义标签) + SuccessCount(复用计数) + AutoSaved(自动存) + Origin(来源)
 // → 支持按标签语义检索、按复用频率排序、自动去重。
@@ -43,25 +43,119 @@ namespace TxTools.Agent.Core
     {
         private const string FileName = "snippets.json";
 
+        private const string Folder = "snippets";
+
         public static List<Snippet> All()
         {
-            foreach (var path in CandidatePaths())
+            EnsureMigrated();
+
+            var list = new List<Snippet>();
+            foreach (var doc in MdStore.LoadAll(Folder))
             {
-                try
-                {
-                    if (!File.Exists(path)) continue;
-                    var list = JsonConvert.DeserializeObject<List<Snippet>>(File.ReadAllText(path, Encoding.UTF8));
-                    if (list != null)
-                    {
-                        // 兼容旧版无 Tags 字段的片段
-                        foreach (var s in list)
-                            if (s.Tags == null) s.Tags = new List<string>();
-                        return list;
-                    }
-                }
-                catch { }
+                var sn = FromDoc(doc);
+                if (sn != null) list.Add(sn);
             }
-            return new List<Snippet>();
+            return list;
+        }
+
+        // ── MD 映射 ──
+        //  frontmatter 放元数据,正文放说明 + 代码围栏。
+        //  这样一条 snippet 就是一份能直接读、直接改、直接复制的文档。
+
+        private static MarkdownDoc ToDoc(Snippet s)
+        {
+            var doc = new MarkdownDoc();
+            doc.Set("key", s.Name ?? "");
+            doc.Set("name", s.Name ?? "");
+            doc.SetList("tags", s.Tags);
+            doc.Set("success_count", s.SuccessCount);
+            doc.Set("origin", s.Origin ?? "");
+            doc.Set("conv_id", s.ConvId ?? "");
+            doc.Set("created", s.CreatedUtc);
+            if (s.LastUsedUtc != default(DateTime)) doc.Set("last_used", s.LastUsedUtc);
+
+            var sb = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(s.Description))
+            {
+                sb.AppendLine(s.Description.Trim());
+                sb.AppendLine();
+            }
+            sb.AppendLine("```csharp");
+            sb.AppendLine((s.Code ?? "").TrimEnd());
+            sb.AppendLine("```");
+            doc.Body = sb.ToString();
+
+            return doc;
+        }
+
+        private static Snippet FromDoc(MarkdownDoc doc)
+        {
+            if (doc == null) return null;
+            var name = doc.Get("name", doc.Get("key", ""));
+            if (string.IsNullOrWhiteSpace(name)) return null;
+
+            string desc, code;
+            SplitBody(doc.Body, out desc, out code);
+
+            return new Snippet
+            {
+                Name = name,
+                Description = desc,
+                Code = code,
+                Tags = doc.GetList("tags"),
+                SuccessCount = doc.GetInt("success_count", 0),
+                Origin = doc.Get("origin", ""),
+                ConvId = doc.Get("conv_id", ""),
+                CreatedUtc = doc.GetDate("created"),
+                LastUsedUtc = doc.GetDate("last_used")
+            };
+        }
+
+        /// <summary>正文拆成"围栏前的说明"和"围栏里的代码"。没有围栏就整篇当代码。</summary>
+        private static void SplitBody(string body, out string desc, out string code)
+        {
+            desc = "";
+            code = "";
+            if (string.IsNullOrEmpty(body)) return;
+
+            int open = body.IndexOf("```", StringComparison.Ordinal);
+            if (open < 0) { code = body.Trim(); return; }
+
+            desc = body.Substring(0, open).Trim();
+
+            int lineEnd = body.IndexOf('\n', open);
+            if (lineEnd < 0) return;
+
+            int close = body.IndexOf("```", lineEnd, StringComparison.Ordinal);
+            if (close < 0) close = body.Length;
+
+            code = body.Substring(lineEnd + 1, close - lineEnd - 1).TrimEnd();
+        }
+
+        private static void EnsureMigrated()
+        {
+            MdStore.MigrateOnce(Folder, "snippets.json", json =>
+            {
+                var list = JsonConvert.DeserializeObject<List<Snippet>>(json);
+                if (list == null) return;
+                foreach (var s in list)
+                {
+                    if (s == null || string.IsNullOrWhiteSpace(s.Name)) continue;
+                    if (s.Tags == null) s.Tags = new List<string>();
+                    WriteOne(s);
+                }
+            });
+        }
+
+        private static void WriteOne(Snippet s)
+        {
+            var slug = MdStore.UniqueSlug(Folder, MarkdownDoc.Slug(s.Name), s.Name);
+            MdStore.Write(Folder, slug, ToDoc(s));
+        }
+
+        private static string SlugOf(string name)
+        {
+            return MdStore.UniqueSlug(Folder, MarkdownDoc.Slug(name), name);
         }
 
         public static Snippet Get(string name)
@@ -108,24 +202,21 @@ namespace TxTools.Agent.Core
         public static void Upsert(Snippet snippet)
         {
             if (snippet == null || string.IsNullOrWhiteSpace(snippet.Name)) return;
-            var all = All();
-            all.RemoveAll(s => string.Equals(s.Name, snippet.Name, StringComparison.OrdinalIgnoreCase));
+            EnsureMigrated();
             if (snippet.CreatedUtc == default(DateTime)) snippet.CreatedUtc = DateTime.UtcNow;
             if (snippet.Tags == null) snippet.Tags = new List<string>();
-            all.Add(snippet);
-            SaveAll(all);
+            WriteOne(snippet);   // 一物一文件:只动这一条,不用整份读-改-写
         }
 
         /// <summary>增加片段的 SuccessCount 并更新 LastUsedUtc（复用计数）。</summary>
         public static void IncrementUsage(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) return;
-            var all = All();
-            var s = all.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+            var s = Get(name);
             if (s == null) return;
             s.SuccessCount++;
             s.LastUsedUtc = DateTime.UtcNow;
-            SaveAll(all);
+            WriteOne(s);
         }
 
         /// <summary>检测是否已有非常相似的片段（避免自动存重复代码）。</summary>
@@ -163,11 +254,9 @@ namespace TxTools.Agent.Core
         public static bool Remove(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) return false;
-            var all = All();
-            int n = all.RemoveAll(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase));
-            if (n == 0) return false;
-            SaveAll(all);
-            return true;
+            var s = Get(name);
+            if (s == null) return false;
+            return MdStore.Delete(Folder, SlugOf(s.Name));
         }
 
         // ── 标签提取：从 C# 代码中自动识别 PS SDK 类名 / 操作 ──
@@ -298,39 +387,5 @@ namespace TxTools.Agent.Core
             return sb.ToString();
         }
 
-        private static void SaveAll(List<Snippet> all)
-        {
-            var json = JsonConvert.SerializeObject(all ?? new List<Snippet>(), Formatting.Indented);
-            foreach (var path in CandidatePaths())
-            {
-                try
-                {
-                    var dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    File.WriteAllText(path, json, Encoding.UTF8);
-                    return;
-                }
-                catch { }
-            }
-        }
-
-        private static string[] CandidatePaths()
-        {
-            string pluginDir = null;
-            try { pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); }
-            catch { }
-
-            var localDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TxTools.Agent");
-
-            if (string.IsNullOrEmpty(pluginDir))
-                return new[] { Path.Combine(localDir, FileName) };
-
-            return new[]
-            {
-                Path.Combine(pluginDir, FileName),
-                Path.Combine(localDir, FileName)
-            };
-        }
     }
 }

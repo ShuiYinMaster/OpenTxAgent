@@ -28,6 +28,7 @@ using Newtonsoft.Json.Linq;
 using Tecnomatix.Engineering;
 using Tecnomatix.Engineering.Ui;
 using TxTools.Agent.Core;
+using TxTools.Agent.Harness;   // HarnessAgentLoop
 using TxTools.Common;   // FormUiKit
 
 namespace TxTools.Agent.UI
@@ -39,7 +40,14 @@ namespace TxTools.Agent.UI
         // ── 依赖 ──
         private readonly ToolRegistry _tools;
         private DeepSeekClient _client;
-        private AgentLoop _loop;
+        private IAgentLoop _loop;
+
+        /// <summary>
+        /// 是否启用新 harness(TxAgent.Core)引擎。默认 false,保持原有 AgentLoop 行为不变。
+        /// 改为 true 即切换到 HarnessAgentLoop(用新 harness 的 AgentLoop 驱动现有 26 个工具)。
+        /// 见 Agent/Core/Harness/README_Harness接入.md。
+        /// </summary>
+        private const bool UseNewHarness = true;
         private CancellationTokenSource _cts;
         private Conversation _current;
 
@@ -63,6 +71,13 @@ namespace TxTools.Agent.UI
         private TaskCompletionSource<bool> _pendingApproval;
         private readonly object _pendingApprovalLock = new object();
 
+        /// <summary>
+        /// 挂起的 ask_user 请求 —— 跟 approval 同款机制。
+        /// null 表示无挂起;value 是用户输入(取消返回 null)。
+        /// </summary>
+        private TaskCompletionSource<string> _pendingAskUser;
+        private readonly object _pendingAskUserLock = new object();
+
         // ── WebView2 ──
         private WebView2 _webView;
         private bool _webViewReady;
@@ -81,6 +96,14 @@ namespace TxTools.Agent.UI
             FormUiKit.InitStandardForm(this,
                 "TxTools.Agent \u2014 PDPS AI \u52a9\u624b (DeepSeek)",
                 DesignSize, new System.Drawing.Size(420, 480), sizable: true);
+
+            // 崩溃兜底 —— PS 进程内出现 unhandled exception 时,先把当前对话强制落盘
+            // 应对 AI 长任务跑到一半 PS 突然崩溃的场景;不是所有崩溃都能抓到(native 崩溃抓不到),
+            // 但配合 AgentLoop 里"每个工具完成即写盘"的机制,能覆盖 99% 的丢失场景
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                try { SaveCurrent(); } catch { }
+            };
 
             // TxForm 默认半模态,会挡住其它窗口;关掉才是真正的非模态
             try { SemiModal = false; } catch { }
@@ -341,14 +364,24 @@ namespace TxTools.Agent.UI
 
                     case "userStop":
                         try { if (_cts != null) _cts.Cancel(); } catch { }
-                        // 若此时正等待审批,视为拒绝解除阻塞,让 SendAsync 尽快返回
+                        // 若此时正等待审批/askUser,视为取消解除阻塞,让 SendAsync 尽快返回
                         ReleasePendingApproval(false);
+                        ReleasePendingAskUser(null);
                         break;
 
                     case "approvalResult":
                         {
                             bool allow = msg["allow"] != null && (bool)msg["allow"];
                             ReleasePendingApproval(allow);
+                            break;
+                        }
+
+                    case "askUserResponse":
+                        {
+                            // 用户答复了 ask_user 弹窗。cancelled 时 answer 传 null
+                            var cancelled = msg["cancelled"] != null && (bool)msg["cancelled"];
+                            var answer = cancelled ? null : (string)msg["answer"];
+                            ReleasePendingAskUser(answer);
                             break;
                         }
 
@@ -553,7 +586,108 @@ namespace TxTools.Agent.UI
 
         private void PostStatus(string text) { PostJs(new { type = "status", text }); }
         private void PostBusy(bool busy) { PostJs(new { type = "busy", value = busy }); }
-        private void PostTokenUsage(int p, int c, int t) { PostJs(new { type = "tokenUsage", prompt = p, completion = c, total = t }); }
+        /// <summary>
+        /// 下发 token 用量。除累计输入/输出外,还附带一份【上下文占用估算】:
+        ///   ctxUsed / ctxMax  当前上下文占了模型窗口的多少
+        ///   parts             按 系统提示词 / 工具定义 / 对话消息 三段拆分
+        /// 分项是按字符数估算的(中英文混排取 2 字符≈1 token),不是 API 精确计数 ——
+        /// 页面上已标注"估算值",用途是让用户知道该压缩哪一块,不用于计费。
+        /// </summary>
+        private void PostTokenUsage(int p, int c, int t)
+        {
+            int sysTok = 0, msgTok = 0, toolTok = 0;
+
+            try
+            {
+                var loop = _loop;
+                if (loop != null && loop.WorkingMemory != null)
+                {
+                    foreach (var m in loop.WorkingMemory)
+                    {
+                        if (m == null) continue;
+                        int n = EstimateMessageTokens(m);
+                        if (m.Role == "system") sysTok += n;
+                        else msgTok += n;
+                    }
+                }
+                toolTok = EstimateToolTokens();
+            }
+            catch { /* 估算失败不影响主流程,前端拿不到 parts 会自动降级 */ }
+
+            int used = sysTok + msgTok + toolTok;
+            int max = ContextWindowFor(_currentModel);
+
+            PostJs(new
+            {
+                type = "tokenUsage",
+                prompt = p,
+                completion = c,
+                total = t,
+                ctxUsed = used,
+                ctxMax = max,
+                parts = new { system = sysTok, tools = toolTok, messages = msgTok }
+            });
+        }
+
+        private static int EstimateMessageTokens(ChatMessage m)
+        {
+            if (m == null) return 0;
+            int len = 0;
+            if (!string.IsNullOrEmpty(m.Content)) len += m.Content.Length;
+            if (m.ToolCalls != null)
+            {
+                foreach (var tc in m.ToolCalls)
+                {
+                    if (tc == null || tc.Function == null) continue;
+                    len += (tc.Function.Name ?? "").Length;
+                    len += (tc.Function.Arguments ?? "").Length;
+                }
+            }
+            return len / 2;
+        }
+
+        /// <summary>工具定义整轮不变,算一次缓存住。</summary>
+        private int _toolTokensCache = -1;
+
+        private int EstimateToolTokens()
+        {
+            if (_toolTokensCache >= 0) return _toolTokensCache;
+
+            int len = 0;
+            try
+            {
+                foreach (var t in _tools.Tools)
+                {
+                    if (t == null) continue;
+                    len += (t.Name ?? "").Length;
+                    len += (t.Description ?? "").Length;
+                    if (t.InputSchema != null)
+                    {
+                        try { len += JsonConvert.SerializeObject(t.InputSchema).Length; }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+
+            _toolTokensCache = len / 2;
+            return _toolTokensCache;
+        }
+
+        /// <summary>
+        /// 各家模型的上下文窗口。取不到就按 128k 兜底 ——
+        /// 这个值只用来算百分比,宁可保守也不要显示成负数或超 100%。
+        /// </summary>
+        private static int ContextWindowFor(string model)
+        {
+            var m = (model ?? "").ToLowerInvariant();
+            if (m.Contains("kimi") || m.Contains("k2")) return 256000;
+            if (m.Contains("qwen")) return 131072;
+            if (m.Contains("gpt-4.1") || m.Contains("o3") || m.Contains("o4")) return 200000;
+            if (m.Contains("claude")) return 200000;
+            if (m.Contains("deepseek")) return 128000;
+            return 128000;
+        }
 
         private void PostConvList()
         {
@@ -922,6 +1056,24 @@ namespace TxTools.Agent.UI
             try { ConversationStore.Save(_current); } catch { }
         }
 
+        /// <summary>
+        /// 关闭 form 前兜底保存。
+        /// 覆盖:用户点关闭按钮 / Alt+F4 / PS 正常退出。
+        /// 不覆盖:PS 进程被强杀 (Task Manager 结束进程 / native 崩溃) —— 那种场景靠
+        ///        AgentLoop 里"每个工具完成即 SaveCurrent"的增量保存来兜底。
+        /// </summary>
+        protected override void OnFormClosing(System.Windows.Forms.FormClosingEventArgs e)
+        {
+            // 先放行所有挂起的等待,否则阻塞在 tcs.Task.Result 上的后台线程会一直悬着
+            try { AskUserBridge.Handler = null; } catch { }
+            try { ReleasePendingAskUser(null); } catch { }
+            try { ReleasePendingApproval(false); } catch { }
+            try { if (_cts != null) _cts.Cancel(); } catch { }
+
+            try { SaveCurrent(); } catch { }
+            base.OnFormClosing(e);
+        }
+
         /// <summary>把消息数组序列化成 restore payload,交给 chat.html 一次性渲染。</summary>
         private void RestoreTranscriptToJs(IEnumerable<ChatMessage> messages)
         {
@@ -980,7 +1132,7 @@ namespace TxTools.Agent.UI
         //  AgentLoop 构造 + 事件转发
         // ─────────────────────────────────────────────────────
 
-        private AgentLoop BuildLoop(DeepSeekClient client)
+        private IAgentLoop BuildLoop(DeepSeekClient client)
         {
             var options = new AgentOptions { Model = _currentModel };
 
@@ -988,7 +1140,12 @@ namespace TxTools.Agent.UI
             options.AutoApproveTools.Add("add_fact");
             options.AutoApproveTools.Add("add_gotcha_correction");
 
-            var loop = new AgentLoop(client, _tools, options);
+            IAgentLoop loop;
+            if (UseNewHarness)
+                loop = new HarnessAgentLoop(client, _tools, options);
+            else
+                loop = new AgentLoop(client, _tools, options);
+
             if (_current != null && !string.IsNullOrEmpty(_current.Id))
                 loop.SetConvId(_current.Id);
 
@@ -1010,10 +1167,30 @@ namespace TxTools.Agent.UI
                 PostStatus("\u5c31\u7eea\u3002");
             };
             loop.ApprovalRequest = AskApproval;
+            loop.AskUserRequest = AskUser;
+
+            // ask_user 富负载通道:支持 multi_choice / form / allow_custom / multiline。
+            // 每次 BuildLoop 重挂一次,避免 form 重建后残留旧实例引用。
+            AskUserBridge.Handler = AskUserRich;
+
+            // 新 harness 独有能力(旧 AgentLoop 不实现该接口,as 得到 null 自动跳过)
+            var streaming = loop as IStreamingAgentLoop;
+            if (streaming != null)
+            {
+                // LLM 重试导致已发出的半截文本作废 —— 收尾当前气泡,
+                // 让重试内容另起一条,不至于和废弃内容拼在一起。
+                streaming.ContentReset += () => PostJs(new { type = "closeAssistant" });
+            }
             loop.HistoryChanged += SaveCurrent;
+            // 会话同步回 WorkingMemory 之后再刷一次上下文估算,否则分项永远滞后一轮
+            loop.HistoryChanged += () => PostTokenUsage(
+                loop.TotalPromptTokens, loop.TotalCompletionTokens, loop.TotalTokens);
             loop.TokenUsed += (p, c, t) => PostTokenUsage(loop.TotalPromptTokens, loop.TotalCompletionTokens, loop.TotalTokens);
 
-            AgentLoop.Current = loop;
+            // 旧 AgentLoop 的静态入口(记忆工具用它取 convId);新 harness 模式下不设置(记忆工具优雅降级)。
+            var oldLoop = loop as AgentLoop;
+            if (oldLoop != null) AgentLoop.Current = oldLoop;
+
             return loop;
         }
 
@@ -1131,6 +1308,115 @@ namespace TxTools.Agent.UI
             TaskCompletionSource<bool> tcs;
             lock (_pendingApprovalLock) { tcs = _pendingApproval; }
             if (tcs != null) tcs.TrySetResult(allow);
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  ask_user 弹出提问 —— AI 主动向用户问 confirm/choice/input
+        //
+        //  跟 AskApproval 同款机制:
+        //    1. AI 调 ask_user 工具 → 转到 AgentLoop.AskUserRequest 委托
+        //    2. TxAgentForm.AskUser 建 TaskCompletionSource<string>,PostJs 显示 modal
+        //    3. 后台线程阻塞 tcs.Task.Result 等 JS 消息
+        //    4. 用户点按钮/输入 → JS post askUserResponse → 主线程 ReleasePendingAskUser
+        //  安全前提: RunOneTool 跑在 Task.Run 的线程池线程,不阻塞 UI 线程。
+        // ─────────────────────────────────────────────────────
+
+        private string AskUser(string question, string kind, string[] options)
+        {
+            if (!_webViewReady) return null;   // WebView 未就绪 —— 无法弹窗,视为取消
+
+            var tcs = new TaskCompletionSource<string>();
+            lock (_pendingAskUserLock)
+            {
+                if (_pendingAskUser != null) _pendingAskUser.TrySetResult(null);
+                _pendingAskUser = tcs;
+            }
+
+            try
+            {
+                PostJs(new
+                {
+                    type = "askUser",
+                    question = question ?? "",
+                    kind = kind ?? "confirm",
+                    options = options ?? new string[0]
+                });
+                return tcs.Task.Result;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                lock (_pendingAskUserLock)
+                {
+                    if (_pendingAskUser == tcs) _pendingAskUser = null;
+                }
+            }
+        }
+
+        /// <summary>解除当前挂起的 ask_user(视为传入答复;null=取消)。多次调用幂等。</summary>
+        private void ReleasePendingAskUser(string answer)
+        {
+            TaskCompletionSource<string> tcs;
+            lock (_pendingAskUserLock) { tcs = _pendingAskUser; }
+            if (tcs != null) tcs.TrySetResult(answer);
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  ask_user 富负载版 —— 挂到 AskUserBridge.Handler
+        //
+        //  旧的 AskUser(question, kind, options) 委托签名带不动
+        //  default / allowCustom / multiline / fields,
+        //  而扩签名要同时改 IAgentLoop、AgentLoop、HarnessAgentLoop 三处。
+        //  这里直接收 JSON 负载原样转给页面,接口一处都不用动。
+        //
+        //  复用 _pendingAskUser 那套 TCS 机制,页面回 askUserResponse 时一起解除。
+        //  抛异常不会导致整轮失败 —— AskUserTool 捕获后会降级到内置 WinForms 对话框。
+        // ─────────────────────────────────────────────────────
+
+        private string AskUserRich(string payloadJson)
+        {
+            if (!_webViewReady)
+                throw new InvalidOperationException("WebView \u672a\u5c31\u7eea");
+
+            // 安全网:本方法必须在后台线程执行。若跑在 UI 线程,
+            // 下面的 tcs.Task.Result 会把 UI 线程占死,用户的点击永远派发不到 ——
+            // 就是之前"一直等待结果、连关闭按钮都点不了"的成因。
+            // 抛出后 AskUserTool 会降级到内置对话框,不至于卡死。
+            if (!InvokeRequired)
+                throw new InvalidOperationException(
+                    "ask_user \u4e0d\u5f97\u5728 UI \u7ebf\u7a0b\u963b\u585e\u7b49\u5f85");
+
+            JObject payload;
+            try { payload = JObject.Parse(payloadJson ?? "{}"); }
+            catch (Exception ex)
+            {
+                throw new ArgumentException("ask_user \u8d1f\u8f7d\u4e0d\u662f\u5408\u6cd5 JSON: " + ex.Message);
+            }
+
+            payload["type"] = "askUser";
+
+            var tcs = new TaskCompletionSource<string>();
+            lock (_pendingAskUserLock)
+            {
+                if (_pendingAskUser != null) _pendingAskUser.TrySetResult(null);
+                _pendingAskUser = tcs;
+            }
+
+            try
+            {
+                PostJs(payload);          // 内部 BeginInvoke 异步投递,不占 UI 线程
+                return tcs.Task.Result;   // 在当前(后台)线程等待
+            }
+            finally
+            {
+                lock (_pendingAskUserLock)
+                {
+                    if (_pendingAskUser == tcs) _pendingAskUser = null;
+                }
+            }
         }
 
         /// <summary>原生弹窗兜底 —— WebView 未就绪或已在 UI 线程时用。</summary>

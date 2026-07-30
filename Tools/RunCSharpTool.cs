@@ -3,6 +3,9 @@
 //
 // 安全：IsReadOnly=false -> 每次执行前强制用户审批(审批框展示完整代码)；包在 Undo 块里(可 Ctrl+Z 撤销)；
 //       变更审计写入 audit.log。自带编译器是 C# 5 语法。
+//
+// v4：新增 Python 执行通道(probe_python / run_python)后，本工具的定位收窄为
+//     "性能热点 + 泛型/out 参数密集 + WinForms" 三类。探测类需求一律先走 probe_python。
 
 using Newtonsoft.Json.Linq;
 using TxTools.Agent.Core;
@@ -22,9 +25,24 @@ namespace TxTools.Agent.Tools
                        "代码作为方法体注入，已 using Tecnomatix.Engineering，可用 TxApplication.ActiveDocument 等；" +
                        "用 log(\"...\") 输出、return 任意对象作为结果。" +
                        "约束：自带编译器是 C# 5 语法(无字符串插值、无 ?.、无表达式体)。" +
-                       "先用 list_types/inspect_type/inspect_object 摸清 API 再写。" +
                        "这是会改动场景的操作：执行前需用户确认，操作后可 Ctrl+Z 撤销。" +
-                       "常见C#5陷阱(务必避免)：三元null必须转型(string)null；无$插值用+拼接；无?.空条件用if判断；TxSelection无索引器用.GetItems()[0]。";
+
+                       "【何时用本工具，而不是 Python】" +
+                       "1) 循环规模超过约 1000 次(IronPython 比 C# 慢一到两个数量级，遍历数千焊点、批量 IK 必须走这里)；" +
+                       "2) 需要直接实例化泛型、传 out/ref 参数、处理显式接口实现；" +
+                       "3) 需要创建 WinForms 界面；" +
+                       "4) run_python 连续两次因 .NET 互操作问题失败。" +
+
+                       "【何时改用 Python】" +
+                       "探测 SDK、查询、筛选、串联多个工具这类活，一律先用 probe_python —— " +
+                       "它免审批、执行后强制回滚、且有 tx_dir/tx_type/tx_sig 可以直接查出成员和签名，" +
+                       "比在这里靠猜 API 再编译试错快得多。" +
+                       "本工具连续两次编译失败(尤其是 CS1061/CS0117 这类找不到成员的错误)时，" +
+                       "不要继续猜，改用 probe_python 先把 API 查清楚。" +
+
+                       "【务必避免的 C# 5 陷阱】三元 null 必须转型 (string)null；无 $ 插值，用 + 拼接；" +
+                       "无 ?. 空条件，用 if 判断；TxSelection 无索引器，用 .GetItems()[0]。" +
+                       "写之前先用 list_types / inspect_type / inspect_object 或 probe_python 摸清 API。";
             }
         }
 

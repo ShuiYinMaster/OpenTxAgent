@@ -120,26 +120,40 @@ namespace TxTools.Agent.Core
         }
 
         /// <summary>流式发送：边收边回调文本分片，结束后返回拼装好的 assistant 消息(含 tool_calls)。
-        /// 最后一个 SSE 包中的 usage 字段会写入 outUsage（如不为 null）。</summary>
+        /// 最后一个 SSE 包中的 usage 字段会写入 outUsage（如不为 null）。
+        /// onReasoningDelta 用于推理模型的 reasoning_content 分片；普通模型不会触发。
+        /// 返回的 ChatMessage 上,Content 与 ReasoningContent 均为聚合后的完整文本。</summary>
         public async Task<ChatMessage> SendStreamAsync(ChatRequest request, Action<string> onTextDelta,
-            CancellationToken ct, Action<TokenUsage> onUsage = null)
+            CancellationToken ct, Action<TokenUsage> onUsage = null, Action<string> onReasoningDelta = null)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
+
+            // 不显式要求的话,DeepSeek 流式不返回 token 用量。
+            if (request.StreamOptions == null)
+                request.StreamOptions = new StreamOptions { IncludeUsage = true };
+
             try
             {
-                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage);
+                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage, onReasoningDelta);
+            }
+            catch (LlmApiException ex) when (ShouldRetryWithoutStreamOptions(ex, request))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[DeepSeekClient] 400 stream_options 不支持,自动去掉后重试: " + ex.Message);
+                request.StreamOptions = null;
+                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage, onReasoningDelta);
             }
             catch (LlmApiException ex) when (ShouldRetryWithoutTemperature(ex, request))
             {
                 System.Diagnostics.Debug.WriteLine(
                     "[DeepSeekClient] 400 temperature 不支持,自动去掉 temperature 重试: " + ex.Message);
                 request.Temperature = null;
-                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage);
+                return await SendStreamOnceAsync(request, onTextDelta, ct, onUsage, onReasoningDelta);
             }
         }
 
         private async Task<ChatMessage> SendStreamOnceAsync(ChatRequest request, Action<string> onTextDelta,
-            CancellationToken ct, Action<TokenUsage> onUsage)
+            CancellationToken ct, Action<TokenUsage> onUsage, Action<string> onReasoningDelta)
         {
             request.Stream = true;
             var json = JsonConvert.SerializeObject(request, JsonSettings);
@@ -158,6 +172,7 @@ namespace TxTools.Agent.Core
                     }
 
                     var content = new StringBuilder();
+                    var reasoning = new StringBuilder();
                     var toolAcc = new SortedDictionary<int, ToolCallAcc>();
                     TokenUsage lastUsage = null;
 
@@ -176,7 +191,7 @@ namespace TxTools.Agent.Core
                             JObject chunk;
                             try { chunk = JObject.Parse(data); } catch { continue; }
 
-                            // 顶层 usage（DeepSeek 在末尾 chunk 带回）
+                            // 顶层 usage（DeepSeek 在末尾 chunk 带回，需 stream_options.include_usage）
                             var usageTok = chunk["usage"];
                             if (usageTok != null && usageTok.Type == JTokenType.Object)
                             {
@@ -187,6 +202,18 @@ namespace TxTools.Agent.Core
                             if (choices == null || choices.Count == 0) continue;
                             var delta = choices[0]["delta"] as JObject;
                             if (delta == null) continue;
+
+                            // 思考内容分片(推理模型)。DeepSeek 先吐完 reasoning_content 再吐 content。
+                            var rtok = delta["reasoning_content"];
+                            if (rtok != null && rtok.Type == JTokenType.String)
+                            {
+                                var rfrag = (string)rtok;
+                                if (rfrag.Length > 0)
+                                {
+                                    reasoning.Append(rfrag);
+                                    if (onReasoningDelta != null) onReasoningDelta(rfrag);
+                                }
+                            }
 
                             var ctok = delta["content"];
                             if (ctok != null && ctok.Type == JTokenType.String)
@@ -217,6 +244,7 @@ namespace TxTools.Agent.Core
                     if (lastUsage != null && onUsage != null) onUsage(lastUsage);
 
                     var message = new ChatMessage("assistant", content.Length > 0 ? content.ToString() : null);
+                    if (reasoning.Length > 0) message.ReasoningContent = reasoning.ToString();
                     if (toolAcc.Count > 0)
                     {
                         message.ToolCalls = new List<ToolCall>();
@@ -256,6 +284,19 @@ namespace TxTools.Agent.Core
             if (request == null || !request.Temperature.HasValue) return false;
             var msg = ex.Message ?? "";
             return msg.IndexOf("temperature", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// 同上,针对 stream_options:部分 provider(自建/旧版 Ollama 等)不认这个字段会直接 400。
+        /// 去掉后只是拿不到流式 token 用量,不影响正文与工具调用。
+        /// </summary>
+        private static bool ShouldRetryWithoutStreamOptions(LlmApiException ex, ChatRequest request)
+        {
+            if (ex.StatusCode != 400) return false;
+            if (request == null || request.StreamOptions == null) return false;
+            var msg = ex.Message ?? "";
+            return msg.IndexOf("stream_options", StringComparison.OrdinalIgnoreCase) >= 0
+                || msg.IndexOf("include_usage", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string ExtractError(string body, HttpStatusCode code)
