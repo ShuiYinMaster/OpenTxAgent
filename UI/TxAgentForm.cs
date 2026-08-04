@@ -160,6 +160,7 @@ namespace TxTools.Agent.UI
             FormUiKit.ApplyDpiScaling(this, ref _dpiApplied, DesignSize);
             _loadingTimer.Start();
             InitWebViewAsync();
+            InitKnowledgeIndexAsync();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -255,6 +256,50 @@ namespace TxTools.Agent.UI
         }
 
         /// <summary>
+        /// 知识库向量化初始化:配置嵌入器 + 后台增量重建索引(不卡 UI)。
+        /// 云端(DashScope)零部署、按量计费;本地 ONNX 有模型文件时用 AutoSelect 可自动优先。
+        /// 没配 qwen key 且无本地模型 → Embedder 为 null,search_knowledge 自动退回纯关键字。
+        /// </summary>
+        private void InitKnowledgeIndexAsync()
+        {
+            try
+            {
+                // MD 推荐先跑云端验证效果;要切本地 ONNX 时改成 KnowledgeIndex.AutoSelect()
+                KnowledgeIndex.Embedder = DashScopeEmbedder.TryCreate();
+            }
+            catch (Exception ex)
+            {
+                try { AuditLog.Write("[warn] [Embed] 嵌入器初始化失败: " + ex.Message); } catch { }
+                KnowledgeIndex.Embedder = null;
+            }
+
+            if (KnowledgeIndex.Embedder == null)
+            {
+                PostStatus("知识库向量检索未启用(未配置 qwen key)——search_knowledge 走纯关键字。");
+                return;
+            }
+
+            if (KnowledgeStore.IsEmpty)
+            {
+                PostStatus("知识库为空，跳过向量索引。放 .md 到 " + KnowledgeStore.FolderPath() + " 后重开生效。");
+                return;
+            }
+
+            PostStatus("正在构建知识库向量索引…");
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await KnowledgeIndex.BuildAsync(CancellationToken.None, msg => PostStatus(msg));
+                }
+                catch (Exception ex)
+                {
+                    try { AuditLog.Write("[warn] [Embed] 索引构建失败: " + ex.Message); } catch { }
+                }
+            });
+        }
+
+        /// <summary>
         /// 从当前程序集读取嵌入的 chat.html 文本(UTF-8,自动跳 BOM)。
         /// 用 EndsWith("chat.html") 模糊匹配资源名,避免根命名空间/子目录变化时改代码。
         /// </summary>
@@ -334,6 +379,9 @@ namespace TxTools.Agent.UI
                             var pid = (string)msg["providerId"];
                             if (!string.IsNullOrWhiteSpace(pid))
                                 _currentProviderId = pid;
+                                // 同名模型跨 provider 会重名(百炼代理了 deepseek/kimi),
+                                // 路由必须知道当前是哪一家,否则按名反查会串到别家去
+                                ModelRouter.CurrentProviderId = pid;
                             ApplyKey(newKey, persist: true);
                             break;
                         }
@@ -454,6 +502,7 @@ namespace TxTools.Agent.UI
             {
                 var prefs = UserPrefsStore.Load();
                 if (!string.IsNullOrWhiteSpace(prefs.ProviderId)) _currentProviderId = prefs.ProviderId;
+                ModelRouter.CurrentProviderId = _currentProviderId;
                 if (!string.IsNullOrWhiteSpace(prefs.Model)) _currentModel = prefs.Model;
                 if (!string.IsNullOrWhiteSpace(prefs.ApprovalMode)) _approvalMode = prefs.ApprovalMode;
 
@@ -615,7 +664,7 @@ namespace TxTools.Agent.UI
             catch { /* 估算失败不影响主流程,前端拿不到 parts 会自动降级 */ }
 
             int used = sysTok + msgTok + toolTok;
-            int max = ContextWindowFor(_currentModel);
+            int max = ModelRouter.ContextWindowFor(_currentModel, _currentProviderId);
 
             PostJs(new
             {
@@ -674,20 +723,7 @@ namespace TxTools.Agent.UI
             return _toolTokensCache;
         }
 
-        /// <summary>
-        /// 各家模型的上下文窗口。取不到就按 128k 兜底 ——
-        /// 这个值只用来算百分比,宁可保守也不要显示成负数或超 100%。
-        /// </summary>
-        private static int ContextWindowFor(string model)
-        {
-            var m = (model ?? "").ToLowerInvariant();
-            if (m.Contains("kimi") || m.Contains("k2")) return 256000;
-            if (m.Contains("qwen")) return 131072;
-            if (m.Contains("gpt-4.1") || m.Contains("o3") || m.Contains("o4")) return 200000;
-            if (m.Contains("claude")) return 200000;
-            if (m.Contains("deepseek")) return 128000;
-            return 128000;
-        }
+
 
         private void PostConvList()
         {
@@ -927,6 +963,15 @@ namespace TxTools.Agent.UI
                     var models = await client.ListModelsAsync(CancellationToken.None);
                     if (models == null || models.Count == 0) return;
 
+                    int rawCount = models.Count;
+
+                    // /v1/models 返回的是平台【全量目录】,不是"我能用的":
+                    // 百炼的业务空间白名单只管调用鉴权,不影响这里的返回内容;
+                    // 目录里还混着 embedding/rerank/tts、日期快照变体、
+                    // 以及不支持 function calling 的小参数模型。清洗一遍再进下拉。
+                    models = ModelFilter.Clean(pid, models, _currentModel);
+                    if (models.Count == 0) return;
+
                     // 排序:让当前选中的模型排最前,其他按字母序
                     models.Sort(StringComparer.OrdinalIgnoreCase);
                     var curModel = _currentModel;
@@ -945,7 +990,9 @@ namespace TxTools.Agent.UI
                         target.Models = models.ToArray();
                         PostProviderAndModelList();
                         PostStatus("\u5df2\u5237\u65b0 " + target.DisplayName + " \u6a21\u578b\u5217\u8868 ("
-                            + models.Count + " \u4e2a)");
+                            + models.Count + " \u4e2a"
+                            + (rawCount > models.Count ? ", \u5df2\u8fc7\u6ee4 " + (rawCount - models.Count) : "")
+                            + ")");
                         // 落盘,下次开窗立即用缓存,不再显示硬编码默认
                         try { UserPrefsStore.UpdateModels(pid, target.Models); } catch { }
                     };
@@ -1177,6 +1224,14 @@ namespace TxTools.Agent.UI
             var streaming = loop as IStreamingAgentLoop;
             if (streaming != null)
             {
+                // 思考过程(推理模型的 reasoning_content)。
+                // 普通模型不返回该字段,这三个事件根本不会触发,不影响现有行为。
+                // 注意思考内容不进历史 —— API 禁止把 reasoning_content 回传下一轮,
+                // 所以它也不落盘,重开对话看不到。
+                streaming.ReasoningStarted += () => PostJs(new { type = "reasoningStart" });
+                streaming.ReasoningDelta += t => PostJs(new { type = "reasoningDelta", text = t });
+                streaming.ReasoningEnded += () => PostJs(new { type = "reasoningEnd" });
+
                 // LLM 重试导致已发出的半截文本作废 —— 收尾当前气泡,
                 // 让重试内容另起一条,不至于和废弃内容拼在一起。
                 streaming.ContentReset += () => PostJs(new { type = "closeAssistant" });

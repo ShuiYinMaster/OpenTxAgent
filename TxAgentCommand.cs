@@ -109,19 +109,36 @@ namespace TxTools.Agent
             reg.Register(new DeleteRecipeTool(reg));
 
             // 3) 记忆系统工具 (v2) —— 跨对话记忆的读写入口
-            //    convId 通过 AgentLoop.Current 静态入口获取。form 构造 loop 后写入 Current,
-            //    lambda 每次调用时读取,即使 Current 为 null(未打开窗口)也返回 null 不崩。
-            reg.Register(new SearchPastConversationsTool(() => AgentLoop.Current?.CurrentConvId));
+            //    convId 通过 AgentLoop.Current / HarnessAgentLoop.Current 静态入口获取。
+            //    form 构造 loop 后写入 Current,lambda 每次调用时读取,即使 Current 为 null 也返回 null 不崩。
+            var getConvId = new Func<string>(() =>
+                AgentLoop.Current?.CurrentConvId ?? TxTools.Agent.Harness.HarnessAgentLoop.Current?.CurrentConvId);
+            reg.Register(new SearchPastConversationsTool(getConvId));
             reg.Register(new ListGotchasTool());
             reg.Register(new AddGotchaCorrectionTool());
             reg.Register(new ListFactsTool());
-            reg.Register(new AddFactTool(() => AgentLoop.Current?.CurrentConvId));
+            reg.Register(new AddFactTool(getConvId));
 
-            // 4) 上传文件解析工具 (v2) —— 让 AI 感知与按需精读 xlsx/csv/txt 等
-            //    上传时前端会把摘要注入用户消息前缀,通常不必先 list;
-            //    但当用户后续再次引用同一附件、或需要深读大文件时,list + read 组合是标准姿势。
-            reg.Register(new ListUploadedFilesTool(() => AgentLoop.Current?.CurrentConvId));
+            // 4) 上传文件解析工具 (v2)
+            reg.Register(new ListUploadedFilesTool(getConvId));
             reg.Register(new ReadUploadedFileTool());
+
+            // 4.5) 弹窗提问工具 —— AI 主动向用户问 confirm/choice/input,阻塞等答复
+            //      简化传统"AI 说话→用户输入框回复"的多步流程,一次点击就返回
+            reg.Register(new AskUserTool());
+
+            // 4.6) 源码工作区工具 —— AI 改项目源码(读/搜/改/建/回滚/编译验证)
+            //      全部限定在 open_workspace 指定的根目录内,防路径穿越。
+            //      code_edit/code_create_file/code_revert 是变更操作,走审批(不加 AutoApprove)。
+            //      code_build 实现了 ITxOffUiThreadTool,编译在后台线程跑,不冻结 PS 主线程。
+            reg.Register(new OpenWorkspaceTool());     // 读：打开工作区(项目根目录)
+            reg.Register(new CodeOutlineTool());       // 读：C# 文件骨架(类型/成员/行号)
+            reg.Register(new CodeReadTool());          // 读：按符号/行号读源码片段
+            reg.Register(new CodeSearchTool());        // 读：跨文件搜索(定位首选)
+            reg.Register(new CodeEditTool());          // 变更：精确串替换(唯一匹配硬约束)
+            reg.Register(new CodeCreateFileTool());    // 变更：新建源码文件
+            reg.Register(new CodeRevertTool());        // 变更：回滚到会话首版(从 .txagent_backup)
+            reg.Register(new CodeBuildTool());         // 读：编译工作区项目(只回错误诊断)
 
             // 5) 加载已保存的配方,注册成工具 (启动即可用)
             foreach (var recipe in RecipeStore.Load())
