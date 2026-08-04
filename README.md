@@ -18,6 +18,9 @@
 | 加记忆条目 | [记忆系统](#记忆系统) → Snippet/Fact/Gotcha,一物一 Markdown 文件 |
 | 换循环引擎 | [Agent Harness](#agent-harness-txagentcore) → `TxAgentForm.UseNewHarness` 一个常量切换 |
 | 查 PS API 签名 | [API 知识库](#api-知识库) → `api_lookup` 直接反射,不用再 probe |
+| 挂本地资料 | [本地知识库](#本地知识库) → md 丢进 `memory/knowledge/`,支持语义检索 |
+| 让 AI 看图 | [图像识别](#图像识别) → `analyze_image` / `analyze_viewport`,委托给视觉模型 |
+| 改别的插件源码 | [源码工具](#源码工具) → 骨架/行段读 + 精确替换 + 编译验证 |
 | 生成文档 | [文档生成](#文档生成-docxxlsxpptx) → docx/xlsx/pptx 均从零建 |
 | 截图/相机 | [PS 视口 & 相机](#ps-视口--相机) → `capture_viewer_image` + `set_camera_view` |
 
@@ -185,6 +188,20 @@ public interface ITxOffUiThreadTool { }   // 标记接口,禁止封送
   给出可直接照抄的完整签名,并标出已废弃成员和历史踩坑注解。
 - `api_note` — 把试错发现的运行期行为记回去,下次查同一类型自动带出。
 
+### 本地知识库
+- `search_knowledge` / `read_knowledge` — 检索与读取用户自备的 md 资料
+- `knowledge_status` / `knowledge_reindex` — 查看索引状态、重建向量索引
+
+### 图像识别
+- `analyze_image` — 看已上传的图片
+- `analyze_viewport` — 截当前 3D 视口并识别，一步完成
+
+### 源码工具（改别的插件）
+- `open_workspace` — 指定项目根目录，之后读写都限定在此
+- `code_search` / `code_outline` / `code_read` — 定位 → 看骨架 → 读那一段
+- `code_edit` / `code_create_file` / `code_revert` — 精确串替换、新建、回滚
+- `code_build` — MSBuild 编译并回传诊断
+
 ### 交互 & 记忆
 - `ask_user` — 弹窗提问,五种形态:confirm / choice / multi_choice / input / **form(混合表单)**
 - `save_snippet` / `list_snippets` / `get_snippet` / `find_snippet`
@@ -336,6 +353,145 @@ turns: 6
 
 检索是两段式:`search_past_conversations` 只扫索引,拿到 id 后用
 `read_past_conversation(conv_id, query?)` 按需读原始 JSON 取细节。
+
+---
+
+## 本地知识库
+
+把 `.md` 丢进 `memory/knowledge/`，重开对话即生效，没有导入步骤。
+
+### 目录常驻 + 按需取节
+
+三种做法的取舍：
+
+| 做法 | 问题 |
+|---|---|
+| 整篇塞系统提示词 | 文档一大就吃光上下文，且大部分内容与当前问题无关 |
+| 只给检索工具 | **模型不知道有这东西，压根想不到去搜** —— 知识库建了没人用 |
+| **目录常驻 + 按需取节** | 目录几百 token，模型看得见有什么；细节按需取 |
+
+目录是静态的，常驻系统提示词对 prefix 缓存友好，这部分开销可以忽略。
+
+### 分节
+
+按 `#` / `##` / `###` 切块，每节记录**祖先路径**（面包屑）。
+面包屑不是可选的：「已知问题」这种标题单看毫无信息量，
+带上「工艺设计器接口」之后模型才知道它在讲什么，检索时也能命中上层主题词。
+面包屑同时进入嵌入文本。
+
+分节器还做了三件事，都是被实际文档逼出来的：
+
+- **超长节按段落再切**（`MaxSectionChars` 默认 3000）—— 一节 100KB 的表格嵌入必被截断
+- **剥离锚点/HTML/内部跳转链接** —— 纯导航结构，进向量只会稀释语义
+- **跳过目录索引类小节** —— 它包含全文所有标题，任何关键词都能命中，
+  会稳定挤掉真正有内容的小节。这是大部头知识库最典型的检索污染源
+
+### 混合检索
+
+向量擅长语义（「焊枪装在哪个法兰」↔「TCP 与 Toolframe 的挂接关系」），
+但对精确串很弱 —— 搜 `TxWeldOperation`、`CS1061` 这类型号/API 名，关键字更准。
+技术文档里两类查询各占一半，所以两路都跑，用 **RRF（Reciprocal Rank Fusion）** 融合：
+
+```
+score = Σ 1 / (60 + 该路名次)
+```
+
+只看名次不看分数。两路分值量纲完全不同（余弦相似度 vs 关键字计数），
+直接加权是错的，归一化又易被离群值带偏。RRF 规避了这个问题，
+而且**没有需要调的权重**。命中结果标 `vector` / `keyword` / `both`，调效果时一眼看出哪路在起作用。
+
+### 向量化
+
+`IEmbedder` 两套实现，接口相同可随时切换：
+
+| | 云端 `DashScopeEmbedder` | 本地 `OnnxEmbedder` |
+|---|---|---|
+| 部署 | 零部署，复用百炼 key | 需放 model.onnx + vocab.txt |
+| 成本 | 0.0007 元/千 token | 免费 |
+| 模型 | text-embedding-v4 | bge-small-zh-v1.5（24M / ~90MB） |
+
+三个做错了不报错但效果会差的细节：
+
+- **向量必须 L2 归一化** —— 归一化后余弦相似度即点积，省掉每次算模长
+- **嵌入文本要带标题和面包屑** —— 只嵌正文的话主题信息就丢了
+- **换模型必须重建索引** —— 不同模型向量空间不通用，`EmbedderId` 不匹配时自动放弃向量路径
+
+按内容 hash 增量记账，改一节不会触发全量重算。
+
+本地 ONNX 路线有两个坑：分词器要自己写（ONNX Runtime 不含分词，
+而引 BERT 分词器包又是一次版本冲突风险）；池化方式选错**不会报错**，
+只是相似度整体失真 —— bge 用 CLS，m3e/text2vec 用 Mean。
+
+---
+
+## 图像识别
+
+DeepSeek 系列不支持视觉。两条路：
+
+| | 委托模式（本方案） | 直连（主模型换成 kimi-k3） |
+|---|---|---|
+| 图片在上下文 | 不驻留，只留文字描述 | 驻留，**每轮都要重发** |
+| prefix 缓存 | 保持 | 换模型即重建 |
+| 成本 | 主对话缓存价 + 看图约 1 分/张 | 全程按视觉模型价 |
+
+委托的省钱幅度比表面更大：**每次委托都是全新的短上下文**，
+而图片留在主对话里是每轮重发。
+
+`ChatMessage.Content` 保持 `string` 属性不变，新增 `ContentParts`；
+序列化时 **parts 为空发字符串、非空才发数组**。纯文本路径逐字节不变 ——
+否则所有 provider 兼容性都要重测，prompt 前缀也会整体变化。
+
+`ModelRouter` 按能力选模型，三条原则：主对话模型永远听用户的，
+路由只管主模型干不了的活；找不到候选返回 null 让上层报错，不静默换模型；
+没配 key 的 provider 直接跳过。
+
+默认值都调成省钱档：provider 用千问、`detail=low`、视口截图 1024×576。
+`high` 会把图切成多 tile 分别编码，通常贵几倍，而判断题 `low` 足够。
+
+---
+
+## 源码工具
+
+用 TxAgent 改**其他插件**的源码。核心结论和 harness 那次一样：
+**别整文件读，也别整文件改**。
+
+### 读：三级递进
+
+`code_search` 定位 → `code_outline` 看骨架 → `code_read` 读那一段。
+
+一个 3000 行的 `.cs` 整读约 4 万 token，读两个文件上下文就废了；
+骨架通常只有百来行。骨架解析用正则 + 花括号计数，**没引 Roslyn** ——
+那是重依赖，而且遇到新语法特性时正则至少不会整个罢工。
+
+### 改：精确串替换
+
+`old_string` 必须在文件里**恰好出现一次**，0 次或多次一律拒绝。
+让模型输出整个新文件有三个问题：几万 token 又慢又贵；
+它会在无关处悄悄改动，review 时看不出来；长输出可能被 `max_tokens` 截断，
+写出半个文件直接毁掉源码。
+
+处理了两个容易忽略的细节：换行符归一化后再匹配（模型很难保证输出 `\r\n`），
+保留原文件编码与 BOM（避免改一行把整个文件编码换掉）。
+
+### 验：编译反馈闭环
+
+**这是整套工具里最重要的一个。** 接上之前模型改 C# 一次成功率大概五成，
+接上之后通常两三轮收敛 —— CS 错误码 + 文件 + 行号是极强的信号。
+只回解析出的诊断行，不回整个构建日志（msbuild 一次输出几千行）。
+
+### 两个编译器别混淆
+
+| | `run_csharp` 沙箱 | `code_build` |
+|---|---|---|
+| 编译器 | `CSharpCodeProvider`（CodeDom） | MSBuild → Roslyn |
+| 语法上限 | **C# 5** | C# 7.3 起，跟 VS 版本走 |
+
+系统提示词里那堆「C# 5 语法陷阱」**只对 `run_csharp` 成立**。
+
+`FindMsBuild` 优先用 `vswhere.exe` 定位，并**故意排除**
+`Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe` ——
+那是 MSBuild 4.0，会退回传统编译器，遇到 C# 6+ 语法报一堆误导性的语法错误。
+宁可明确报"找不到 MSBuild"，也不要给出会让人查错方向的错误。
 
 ---
 
@@ -608,6 +764,11 @@ PS 崩溃场景:
   且需确认该模型支持 function calling
 - **摘要索引是规则拼装** — 不调 LLM,语义概括能力有限;好处是免费且零延迟
 - **上下文分项用量是估算值** — 按字符数折算,非 API 精确计数
+- **知识库检索质量取决于小节标题** — 标题写「约定三」而不是「焊枪坐标系约定」,
+  向量和关键字都救不了
+- **百炼代理版模型的 function calling 不可靠** — 同名模型在不同 provider 上表现不同,
+  主对话建议走官方端点,代理版留给视觉/嵌入
+- **`code_build` 需要装 VS 或 Build Tools** — 只有 .NET Framework 自带的 MSBuild 不够用
 
 ---
 
@@ -618,3 +779,43 @@ PS 崩溃场景:
 **Layer 2 — 配方 (Recipe)**:稳定的多步工具编排,用户在 UI 或让 AI `save_recipe` 定义,`RecipeStore` 加载时注册成正式工具。AI 视角与内置工具无差。
 
 **Layer 3 — 记忆学习**:AI 用 `run_csharp` 摸出新的 API 用法 → 系统自动 `SnippetStore.Upsert` 存下来 → 下轮遇到相似问题自动召回。踩过的坑 → `add_gotcha_correction` → 系统 prompt 末尾常驻。
+
+---
+
+## 一些经验教训
+
+- **不要用 `screenshot_window` 抓 3D 视图** — 那是整个客户区(含 UI 面板)。用 `capture_viewer_image` (SDK `GetImage`)。
+- **相机操作命令是异步的** — 调完 `ZoomToSelection` 立刻 `GetImage` 会撞未完成的渲染管线 NRE。`Application.DoEvents()` 一下。
+- **PS 里创建的 mfg feature 必须在 `TxUndoTransactionManager.StartTransaction/EndTransaction` 里** — 否则 psz 保存失败("Failed to save data to the specified file location")。
+- **`TxTypeFilter(接口类型)` 返回空集合** — SDK 内部只按具体类型匹配,接口传进去等于空过滤器。
+- **写 `run_csharp` 前必须扫一遍系统 prompt 末尾的 Gotcha 清单** — 省下一次编译失败就省几千 token。
+- **文档 API 上的 "MUST be null" 通常意味着"你调错重载了"** — 不是要你额外做什么。
+- **`JToken.ToString(Formatting)` 在本环境必崩** — 编译期与运行期 Newtonsoft 签名不一致。
+  紧凑序列化一律用 `JsonConvert.SerializeObject(token)`,缩进用无参 `token.ToString()`。
+  根治办法是把引用对齐 PS 自带的那份 DLL,而不是靠"记得别写那个重载"。
+- **模型偶尔返回"空内容 + 无 tool_calls"** — 上下文被撑爆时常见。这条消息一旦进了历史,
+  下一轮原样发回去就是 `400 Invalid assistant message`,而且**之后每一轮都会 400**,
+  报错还不告诉你是哪条。要在入会话和发送出口两处都挡。
+- **工具的"内联失败"必须显式识别** — `run_csharp` 编译失败时不抛异常,而是把 `编译失败：`
+  当正常返回值吐出来。不识别的话,错误回灌、失败计数、熔断三套机制会全部静默失效,
+  表面上一切正常,实际模型在原地打转而框架毫无察觉。
+- **连续失败别急着熔断,先给"换思路"提示** — 实测模型脱困靠的是改变策略
+  (从猜 API 转向先探查),而不是在同一份代码上继续微调。阈值设成 3 会误杀本能成功的任务。
+- **归档和工作记忆是两个东西** — 前者只增不改,后者可压缩可重建。混用会把原始对话物理销毁。
+- **模型不知道的东西,框架帮不上** — harness 能让模型更快意识到自己错了并换策略,
+  但消不掉"不知道 PDPS 的 IronPython 里 `typeof` 不可用"这个知识缺口。
+  真正把 9 次探查压到 1 次的是 API 知识库,不是更好的循环。
+- **静默的错误答案比明确的失败危险得多** — 这个坑连踩三次:
+  同名对象取第一个、模糊匹配取第一个、内联失败当成功。
+  最典型的一次是 `read_knowledge` 的模糊匹配 —— `#TCP` 返回了「TCPF Speed」,
+  看起来像成功,模型就基于错的内容继续推理,连猜二十几轮。
+  如果当时直接报"没有这个小节",它两轮就会停下来说工具坏了。
+  **凡是"命中多个"的场合,一律返回候选列表让调用方重新指定,不要替它选。**
+- **推理模型的思考链计入输出预算** — `max_tokens` 给小了会在思考中途被截断,
+  返回 content 和 tool_calls 全空,表现为"任务莫名结束"。
+  预算给大不花钱,只按实际生成量计费。
+- **别让模型心算** — 手工展开旋转矩阵既慢又容易错,还会把输出预算烧光。
+  能写进 `probe_python` 的计算就别在思考里做。
+- **平台白名单管的是调用,不是列表** — 百炼 `/v1/models` 返回全量目录,
+  业务空间授权只影响能不能调。客户端必须自己过滤,
+  否则下拉里全是 embedding/rerank/日期快照和不支持工具调用的小模型。
