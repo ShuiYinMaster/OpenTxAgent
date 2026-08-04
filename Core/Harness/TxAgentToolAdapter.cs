@@ -104,6 +104,12 @@ namespace TxTools.Agent.Harness
 
                 output = output ?? string.Empty;
 
+                // ── 超长输出截断 ──
+                // 实测一次 query_scene 返回全场景资源的 ID+名称 JSON 可达 6 万字符(≈3 万 token),
+                // 一次就吃掉大半个上下文窗口,后面几轮必然溢出。
+                // 这类输出模型真正需要的是"有哪些、大概多少",不是逐条读完 —— 头尾各留一段即可。
+                output = ClampOutput(output, _tool.Name);
+
                 // [P3] AutoGotcha: 输出含错误特征时自动落库
                 if (IsGotchaWorthy(output) && IsCodeTool(_tool.Name))
                 {
@@ -155,6 +161,57 @@ namespace TxTools.Agent.Harness
                 }
             }
             return reg;
+        }
+
+        // ── 输出截断 ──
+
+        /// <summary>
+        /// 单次工具输出允许进入上下文的最大字符数。
+        ///
+        /// 1M 窗口下可以放宽,但【不要取消】:
+        ///   • 长上下文中段召回率明显低于首尾,塞进去不等于用得上;
+        ///   • 未命中缓存的输入是 1元/M,一次 6 万字符塞几轮就是实打实的钱。
+        /// </summary>
+        public static int MaxOutputChars = 50000;
+
+        /// <summary>截断时保留的头部占比,其余留给尾部(结论/统计通常在末尾)。</summary>
+        private const double HeadRatio = 0.6;
+
+        private static string ClampOutput(string output, string toolName)
+        {
+            if (string.IsNullOrEmpty(output)) return output;
+            if (MaxOutputChars <= 0 || output.Length <= MaxOutputChars) return output;
+
+            int head = (int)(MaxOutputChars * HeadRatio);
+            int tail = MaxOutputChars - head;
+
+            // 尽量切在换行处,避免把一条记录劈成两半
+            int headEnd = output.LastIndexOf('\n', Math.Min(head, output.Length - 1));
+            if (headEnd < head / 2) headEnd = head;
+
+            int tailStart = output.IndexOf('\n', output.Length - tail);
+            if (tailStart < 0 || tailStart > output.Length - tail / 2) tailStart = output.Length - tail;
+
+            int omitted = tailStart - headEnd;
+
+            var sb = new StringBuilder(MaxOutputChars + 400);
+            sb.Append(output, 0, headEnd);
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("……【输出过长，中间省略约 " + omitted + " 字符】……");
+            sb.AppendLine("完整结果没有进入上下文。若确实需要被省略的部分，请缩小查询范围后重新调用");
+            sb.AppendLine("（加类型过滤/名称关键字/父级限定），不要试图让本工具一次返回全部内容。");
+            sb.AppendLine();
+            sb.Append(output, tailStart, output.Length - tailStart);
+
+            try
+            {
+                AuditLog.Write("[warn] [Harness] 工具 " + toolName + " 输出 " + output.Length
+                    + " 字符，已截断至 " + MaxOutputChars);
+            }
+            catch { }
+
+            return sb.ToString();
         }
 
         // ── 异常描述 ──

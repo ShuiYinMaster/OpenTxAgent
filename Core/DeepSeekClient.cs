@@ -114,6 +114,8 @@ namespace TxTools.Agent.Core
                     var parsed = JsonConvert.DeserializeObject<ChatResponse>(body);
                     if (parsed == null || parsed.Choices == null || parsed.Choices.Count == 0)
                         throw new LlmApiException((int)resp.StatusCode, "API 响应为空或无 choices。", body);
+
+                    SplitInlineThink(parsed);
                     return parsed;
                 }
             }
@@ -176,6 +178,13 @@ namespace TxTools.Agent.Core
                     var toolAcc = new SortedDictionary<int, ToolCallAcc>();
                     TokenUsage lastUsage = null;
 
+                    // 部分第三方代理端点(如阿里百炼代理的 deepseek 系列)不把思考放进
+                    // reasoning_content 字段,而是把 <think>...</think> 原样塞在 content 里。
+                    // 不处理的话标签会直接漏到聊天气泡上。这里做一个跨分片的状态机,
+                    // 把 think 区间内的文本改走 reasoning 通道。
+                    bool inThink = false;
+                    var pending = new StringBuilder();   // 可能被标签截断的尾巴
+
                     using (var stream = await resp.Content.ReadAsStreamAsync())
                     using (var reader = new StreamReader(stream, Encoding.UTF8))
                     {
@@ -219,7 +228,9 @@ namespace TxTools.Agent.Core
                             if (ctok != null && ctok.Type == JTokenType.String)
                             {
                                 var frag = (string)ctok;
-                                if (frag.Length > 0) { content.Append(frag); if (onTextDelta != null) onTextDelta(frag); }
+                                if (frag.Length > 0)
+                                    RouteThinkAware(frag, pending, ref inThink,
+                                        content, reasoning, onTextDelta, onReasoningDelta);
                             }
 
                             var tcs = delta["tool_calls"] as JArray;
@@ -238,6 +249,15 @@ namespace TxTools.Agent.Core
                                     }
                                 }
                         }
+                    }
+
+                    // 流结束:把还压在缓冲里的尾巴放出来(不可能再是标签的一半了)
+                    if (pending.Length > 0)
+                    {
+                        var tail = pending.ToString();
+                        pending.Length = 0;
+                        if (inThink) { reasoning.Append(tail); if (onReasoningDelta != null) onReasoningDelta(tail); }
+                        else { content.Append(tail); if (onTextDelta != null) onTextDelta(tail); }
                     }
 
                     // 回调 usage
@@ -261,11 +281,134 @@ namespace TxTools.Agent.Core
             }
         }
 
+        private const string ThinkOpen = "<think>";
+        private const string ThinkClose = "</think>";
+
+        /// <summary>
+        /// 按 &lt;think&gt; 标签把分片分流到正文/思考两个通道。
+        /// 标签可能跨 SSE 分片被切断,所以用 pending 缓冲一小段:
+        /// 只要尾部可能是某个标签的前缀,就先压住不发,等下一片拼上再判断。
+        /// </summary>
+        private static void RouteThinkAware(
+            string frag, StringBuilder pending, ref bool inThink,
+            StringBuilder content, StringBuilder reasoning,
+            Action<string> onTextDelta, Action<string> onReasoningDelta)
+        {
+            pending.Append(frag);
+
+            while (true)
+            {
+                var buf = pending.ToString();
+                var marker = inThink ? ThinkClose : ThinkOpen;
+
+                int idx = buf.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    var before = buf.Substring(0, idx);
+                    Emit(before, inThink, content, reasoning, onTextDelta, onReasoningDelta);
+
+                    pending.Length = 0;
+                    pending.Append(buf.Substring(idx + marker.Length));
+                    inThink = !inThink;
+                    continue;
+                }
+
+                // 没有完整标签:把"肯定安全"的部分放出去,尾部可能是标签前缀的留着
+                int keep = SafeTailLength(buf, marker);
+                if (keep > 0)
+                {
+                    Emit(buf.Substring(0, buf.Length - keep), inThink, content, reasoning,
+                        onTextDelta, onReasoningDelta);
+                    pending.Length = 0;
+                    pending.Append(buf.Substring(buf.Length - keep));
+                }
+                else
+                {
+                    Emit(buf, inThink, content, reasoning, onTextDelta, onReasoningDelta);
+                    pending.Length = 0;
+                }
+                return;
+            }
+        }
+
+        private static void Emit(string text, bool inThink,
+            StringBuilder content, StringBuilder reasoning,
+            Action<string> onTextDelta, Action<string> onReasoningDelta)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            if (inThink)
+            {
+                reasoning.Append(text);
+                if (onReasoningDelta != null) onReasoningDelta(text);
+            }
+            else
+            {
+                content.Append(text);
+                if (onTextDelta != null) onTextDelta(text);
+            }
+        }
+
+        /// <summary>末尾有多少字符可能是 marker 被截断的前缀,需要压住等下一片。</summary>
+        private static int SafeTailLength(string buf, string marker)
+        {
+            int max = Math.Min(marker.Length - 1, buf.Length);
+            for (int n = max; n > 0; n--)
+            {
+                if (string.Compare(buf, buf.Length - n, marker, 0, n,
+                        StringComparison.OrdinalIgnoreCase) == 0)
+                    return n;
+            }
+            return 0;
+        }
+
         private sealed class ToolCallAcc
         {
             public string Id;
             public string Name;
             public readonly StringBuilder Args = new StringBuilder();
+        }
+
+        /// <summary>
+        /// 非流式响应里若 content 内嵌 &lt;think&gt;...&lt;/think&gt;,拆到 ReasoningContent。
+        /// 同上:部分第三方代理端点不返回独立的 reasoning_content 字段。
+        /// </summary>
+        private static void SplitInlineThink(ChatResponse resp)
+        {
+            if (resp == null || resp.Choices == null) return;
+            foreach (var ch in resp.Choices)
+            {
+                var msg = ch != null ? ch.Message : null;
+                if (msg == null || string.IsNullOrEmpty(msg.Content)) continue;
+                if (msg.Content.IndexOf(ThinkOpen, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                var think = new StringBuilder();
+                var body = new StringBuilder();
+                var text = msg.Content;
+                int pos = 0;
+
+                while (pos < text.Length)
+                {
+                    int open = text.IndexOf(ThinkOpen, pos, StringComparison.OrdinalIgnoreCase);
+                    if (open < 0) { body.Append(text, pos, text.Length - pos); break; }
+
+                    body.Append(text, pos, open - pos);
+                    int inner = open + ThinkOpen.Length;
+                    int close = text.IndexOf(ThinkClose, inner, StringComparison.OrdinalIgnoreCase);
+
+                    if (close < 0) { think.Append(text, inner, text.Length - inner); break; }
+
+                    think.Append(text, inner, close - inner);
+                    pos = close + ThinkClose.Length;
+                }
+
+                msg.Content = body.ToString().Trim();
+                if (think.Length > 0)
+                {
+                    msg.ReasoningContent = string.IsNullOrEmpty(msg.ReasoningContent)
+                        ? think.ToString()
+                        : msg.ReasoningContent + "\n" + think;
+                }
+            }
         }
 
         /// <summary>

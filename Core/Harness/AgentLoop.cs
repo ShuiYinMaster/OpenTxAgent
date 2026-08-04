@@ -27,6 +27,14 @@ namespace TxAgent.Core
         /// <summary>LLM 调用层失败（网络/限流）的重试次数。</summary>
         public int MaxLlmRetries { get; set; }
 
+        /// <summary>
+        /// 单次响应的输出预算(max_tokens)。
+        /// 【推理模型的 reasoning_content 计入这个预算】—— 给小了会在思考中途被截断，
+        /// 返回空 content 且无 tool_calls，表现为任务莫名其妙结束。
+        /// 给大不花钱：只按实际生成量计费，这只是上限。
+        /// </summary>
+        public int MaxTokens { get; set; }
+
         /// <summary>true 表示本轮只暴露只读工具（两阶段执行的分析阶段）。</summary>
         public bool ReadOnlyPhase { get; set; }
 
@@ -45,6 +53,7 @@ namespace TxAgent.Core
             MaxConsecutiveToolFailures = 6;
             FailureHintThreshold = 3;
             MaxLlmRetries = 2;
+            MaxTokens = 16384;
             ReadOnlyPhase = false;
             AutoRestorePoint = true;
             EnableStreaming = true;
@@ -82,6 +91,12 @@ namespace TxAgent.Core
         private readonly ToolRegistry _registry;
         private readonly IAgentHost _host;
         private readonly AgentLoopOptions _options;
+
+        /// <summary>
+        /// 本轮流式已发出的正文。取消时用它把"界面上看得见的半截回复"补进会话 ——
+        /// 否则用户点停止后重开对话，会发现刚才明明显示了内容却没保存。
+        /// </summary>
+        private readonly StringBuilder _partial = new StringBuilder();
 
         public AgentLoop(ILlmClient llm, ToolRegistry registry, IAgentHost host, AgentLoopOptions options)
         {
@@ -138,7 +153,23 @@ namespace TxAgent.Core
 
         public async Task<AgentRunResult> RunAsync(AgentSession session, CancellationToken ct)
         {
+            try
+            {
+                return await RunCoreAsync(session, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // 用户点了停止。把本轮已流式发出、但还没入会话的半截正文补进去，
+                // 让"界面显示的"和"保存下来的"一致。
+                FlushPartial(session);
+                throw;
+            }
+        }
+
+        private async Task<AgentRunResult> RunCoreAsync(AgentSession session, CancellationToken ct)
+        {
             var result = new AgentRunResult();
+            _partial.Length = 0;
             var failureCounter = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             RestorePoint restorePoint = null;
 
@@ -174,6 +205,13 @@ namespace TxAgent.Core
                         RaiseContentDelta(response.Content);
                 }
 
+                if (response.Truncated)
+                    _host.Log("warn", "本轮输出被 max_tokens 截断 (completion="
+                        + response.CompletionTokens + ", limit=" + _options.MaxTokens + ")");
+
+                // 本轮内容已经或即将入会话，缓冲作废
+                _partial.Length = 0;
+
                 RaiseTurnCompleted(response.Content);
 
                 // 只在这一轮确实产出了内容或工具调用时才入会话。
@@ -197,9 +235,20 @@ namespace TxAgent.Core
                 {
                     result.Completed = hasPayload;
                     result.FinalMessage = response.Content;
-                    result.StopReason = hasPayload
-                        ? "正常结束"
-                        : "模型返回空响应(无内容也无工具调用)，可能是上下文过长或触发了内容过滤";
+
+                    if (hasPayload)
+                        result.StopReason = "正常结束";
+                    else if (response.Truncated)
+                        result.StopReason = "模型输出预算(max_tokens=" + _options.MaxTokens
+                            + ")在思考阶段就耗尽了，没能产出回答。"
+                            + "推理模型的思考链计入输出预算 —— 调大 AgentLoopOptions.MaxTokens，"
+                            + "或换用非思考模式";
+                    else
+                        result.StopReason = "模型返回空响应(无内容也无工具调用)"
+                            + (string.IsNullOrEmpty(response.FinishReason)
+                                ? "，可能触发了内容过滤"
+                                : "，finish_reason=" + response.FinishReason);
+
                     result.RestorePoint = restorePoint;
                     return result;
                 }
@@ -327,7 +376,12 @@ namespace TxAgent.Core
             var handlers = new LlmStreamHandlers
             {
                 OnReasoningDelta = text => { emitted = true; RaiseReasoningDelta(text); },
-                OnContentDelta = text => { emitted = true; RaiseContentDelta(text); }
+                OnContentDelta = text =>
+                {
+                    emitted = true;
+                    _partial.Append(text);       // 供取消时落库
+                    RaiseContentDelta(text);
+                }
             };
 
             for (int attempt = 0; attempt <= _options.MaxLlmRetries; attempt++)
@@ -337,6 +391,7 @@ namespace TxAgent.Core
                     if (emitted)
                     {
                         RaiseContentReset();
+                        _partial.Length = 0;     // 这半截已作废，别再落库
                         emitted = false;
                     }
                     _host.Log("warn", "LLM 重试第 " + attempt + " 次");
@@ -347,7 +402,8 @@ namespace TxAgent.Core
                 var request = new LlmRequest
                 {
                     Messages = new List<ChatMessage>(session.Messages),
-                    Tools = tools
+                    Tools = tools,
+                    MaxTokens = _options.MaxTokens > 0 ? _options.MaxTokens : 16384
                 };
 
                 try
@@ -370,6 +426,26 @@ namespace TxAgent.Core
             }
 
             return last ?? LlmResponse.Error("未知错误");
+        }
+
+        /// <summary>把中断时的半截正文补进会话。无内容则什么都不做。</summary>
+        private void FlushPartial(AgentSession session)
+        {
+            try
+            {
+                if (session == null) return;
+                var text = _partial.ToString();
+                _partial.Length = 0;
+
+                // 【必须判空】空 assistant 消息(既无 content 又无 tool_calls)
+                // 一旦进历史，下一轮原样发回去就是 400 Invalid assistant message，
+                // 而且之后每一轮都会 400。
+                if (string.IsNullOrWhiteSpace(text)) return;
+
+                session.Add(ChatMessage.CreateAssistant(text + "\n\n[本轮被用户中断]", null));
+                _host.Log("info", "已保存中断前的半截回复(" + text.Length + " 字符)");
+            }
+            catch { }
         }
 
         private ToolResult SafeExecute(ITool tool, string argumentsJson)

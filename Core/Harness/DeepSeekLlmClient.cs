@@ -55,6 +55,7 @@ namespace TxTools.Agent.Harness
 
                 var msg = resp.Choices[0].Message;
                 var outResp = BuildResponse(msg, false);
+                outResp.FinishReason = resp.Choices[0].FinishReason;
                 if (resp.Usage != null)
                 {
                     outResp.PromptTokens = resp.Usage.PromptTokens;
@@ -107,6 +108,13 @@ namespace TxTools.Agent.Harness
                 {
                     outResp.PromptTokens = usage.PromptTokens;
                     outResp.CompletionTokens = usage.CompletionTokens;
+
+                    // SendStreamAsync 只回聚合后的 ChatMessage,拿不到 finish_reason。
+                    // 用量贴着上限 + 没有任何产出 ⇒ 基本可判定是被 max_tokens 截断。
+                    bool empty = string.IsNullOrWhiteSpace(outResp.Content) && !outResp.HasToolCalls;
+                    if (empty && req.MaxTokens > 0
+                        && usage.CompletionTokens >= req.MaxTokens - 32)
+                        outResp.FinishReason = "length";
                 }
                 return outResp;
             }
@@ -152,6 +160,22 @@ namespace TxTools.Agent.Harness
                 AlreadyStreamed = alreadyStreamed
             };
 
+            // 诊断:模型在正文里"口述"要调用某工具,却没发出结构化 tool_calls。
+            // 这是第三方代理端点(如百炼代理的 deepseek 系列)对 tools 支持不完整的典型症状 ——
+            // 模型自己以为调了,实际请求里 tool_calls 是空的,于是它会反复道歉重试、空烧 token。
+            // 这里只记日志不改行为,便于事后定位是模型侧问题而非本地代码问题。
+            if ((msg == null || msg.ToolCalls == null || msg.ToolCalls.Count == 0)
+                && LooksLikeNarratedToolCall(msg != null ? msg.Content : null))
+            {
+                try
+                {
+                    TxTools.Agent.Core.AuditLog.Write(
+                        "[warn] [LLM] 模型在正文里描述了工具调用但未返回 tool_calls —— "
+                        + "该端点可能不支持 function calling，建议换用官方端点或其它模型。");
+                }
+                catch { }
+            }
+
             if (msg != null && msg.ToolCalls != null && msg.ToolCalls.Count > 0)
             {
                 outResp.ToolCalls = new List<ToolCall>(msg.ToolCalls.Count);
@@ -166,6 +190,18 @@ namespace TxTools.Agent.Harness
                 }
             }
             return outResp;
+        }
+
+        /// <summary>正文里出现"调用/工具没生效"这类自述,基本可判定 function calling 没生效。</summary>
+        private static bool LooksLikeNarratedToolCall(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return false;
+            if (content.IndexOf("</think>", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (content.IndexOf("工具没被正确调用", StringComparison.Ordinal) >= 0) return true;
+            if (content.IndexOf("工具调用没有正确发出", StringComparison.Ordinal) >= 0) return true;
+            if (content.IndexOf("没有收到任何工具返回", StringComparison.Ordinal) >= 0) return true;
+            if (content.IndexOf("无法正确调用工具", StringComparison.Ordinal) >= 0) return true;
+            return false;
         }
 
         private static void LogException(Exception ex)

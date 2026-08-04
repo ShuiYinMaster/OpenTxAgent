@@ -44,8 +44,66 @@ namespace TxTools.Agent.Core
     {
         [JsonProperty("role")] public string Role { get; set; }
 
-        [JsonProperty("content", NullValueHandling = NullValueHandling.Ignore)]
+        /// <summary>
+        /// 纯文本内容。多模态消息(ContentParts 非空)时这里存文本部分的合并结果,
+        /// 供日志/摘要/历史压缩等只关心文字的地方使用。
+        /// </summary>
+        [JsonIgnore]
         public string Content { get; set; }
+
+        /// <summary>
+        /// 多模态内容块(文本 + 图片)。为空时序列化成普通字符串 content,
+        /// 非空时序列化成 OpenAI 视觉格式的数组。
+        /// 这样纯文本路径逐字节不变 —— 不影响任何现有 provider 的兼容性,也不动 prompt 前缀缓存。
+        /// </summary>
+        [JsonIgnore]
+        public List<ContentPart> ContentParts { get; set; }
+
+        /// <summary>实际参与序列化的 content 字段:string 或 array,二选一。</summary>
+        [JsonProperty("content", NullValueHandling = NullValueHandling.Ignore)]
+        public object ContentPayload
+        {
+            get
+            {
+                if (ContentParts != null && ContentParts.Count > 0) return ContentParts;
+                return Content;
+            }
+            set
+            {
+                // 反序列化:API 返回的 content 一律是字符串;若是数组则把文本块拼起来
+                if (value == null) { Content = null; return; }
+
+                var jarr = value as Newtonsoft.Json.Linq.JArray;
+                if (jarr == null) { Content = value.ToString(); return; }
+
+                var sb = new System.Text.StringBuilder();
+                foreach (var it in jarr)
+                {
+                    var t = it["text"];
+                    if (t != null) sb.Append((string)t);
+                }
+                Content = sb.ToString();
+            }
+        }
+
+        public bool ShouldSerializeContentPayload()
+        {
+            // assistant 带 tool_calls 时 content 可为 null,交给 NullValueHandling 处理
+            return ContentPayload != null;
+        }
+
+        /// <summary>是否是多模态消息(含图片)。</summary>
+        [JsonIgnore]
+        public bool HasImages
+        {
+            get
+            {
+                if (ContentParts == null) return false;
+                foreach (var p in ContentParts)
+                    if (p != null && p.IsImage) return true;
+                return false;
+            }
+        }
 
         /// <summary>
         /// 推理模型返回的思考内容(DeepSeek reasoner 系列的 reasoning_content)。普通模型为 null。
@@ -57,6 +115,15 @@ namespace TxTools.Agent.Core
 
         public bool ShouldSerializeReasoningContent() { return false; }
 
+        /// <summary>
+        /// 对话前缀续写(Beta):置于 messages 末尾的 assistant 消息标记 prefix=true,
+        /// 模型会【接着这段内容往下写】,而不是另起一段。
+        /// 用途:强制输出格式(预填 "{" 让模型只能补 JSON,不会再包 ```json 围栏)。
+        /// 注意该特性需要 beta 端点 —— base_url 要用 https://api.deepseek.com/beta。
+        /// </summary>
+        [JsonProperty("prefix", NullValueHandling = NullValueHandling.Ignore)]
+        public bool? Prefix { get; set; }
+
         [JsonProperty("tool_calls", NullValueHandling = NullValueHandling.Ignore)]
         public List<ToolCall> ToolCalls { get; set; }
 
@@ -65,6 +132,70 @@ namespace TxTools.Agent.Core
 
         public ChatMessage() { }
         public ChatMessage(string role, string content) { Role = role; Content = content; }
+
+        /// <summary>构造一条带图片的用户消息。images 为 (base64 原文, mime) 列表。</summary>
+        public static ChatMessage CreateWithImages(string role, string text,
+            IEnumerable<KeyValuePair<string, string>> images)
+        {
+            var m = new ChatMessage { Role = role, Content = text ?? "" };
+            m.ContentParts = new List<ContentPart>();
+
+            if (!string.IsNullOrEmpty(text))
+                m.ContentParts.Add(ContentPart.FromText(text));
+
+            if (images != null)
+                foreach (var kv in images)
+                    m.ContentParts.Add(ContentPart.FromImageBase64(kv.Key, kv.Value));
+
+            return m;
+        }
+    }
+
+    /// <summary>
+    /// 多模态内容块。OpenAI 兼容格式,Kimi(Moonshot) / 千问(DashScope OpenAI 模式) / GPT 都认。
+    /// </summary>
+    public sealed class ContentPart
+    {
+        [JsonProperty("type")] public string Type { get; set; }
+
+        [JsonProperty("text", NullValueHandling = NullValueHandling.Ignore)]
+        public string Text { get; set; }
+
+        [JsonProperty("image_url", NullValueHandling = NullValueHandling.Ignore)]
+        public ImageUrl ImageUrl { get; set; }
+
+        [JsonIgnore]
+        public bool IsImage { get { return Type == "image_url"; } }
+
+        public static ContentPart FromText(string text)
+        {
+            return new ContentPart { Type = "text", Text = text };
+        }
+
+        /// <summary>base64 内联。mime 形如 image/png、image/jpeg。</summary>
+        public static ContentPart FromImageBase64(string base64, string mime)
+        {
+            if (string.IsNullOrEmpty(mime)) mime = "image/png";
+            return new ContentPart
+            {
+                Type = "image_url",
+                ImageUrl = new ImageUrl { Url = "data:" + mime + ";base64," + base64 }
+            };
+        }
+
+        public static ContentPart FromImageUrl(string url)
+        {
+            return new ContentPart { Type = "image_url", ImageUrl = new ImageUrl { Url = url } };
+        }
+    }
+
+    public sealed class ImageUrl
+    {
+        [JsonProperty("url")] public string Url { get; set; }
+
+        /// <summary>可选精度:low / high / auto。低精度省 token,判断"有没有""是什么"够用。</summary>
+        [JsonProperty("detail", NullValueHandling = NullValueHandling.Ignore)]
+        public string Detail { get; set; }
     }
 
     public sealed class ToolCall

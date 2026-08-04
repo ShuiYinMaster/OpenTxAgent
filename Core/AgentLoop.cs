@@ -49,7 +49,10 @@ namespace TxTools.Agent.Core
             MaxTokens = 4096;
             Temperature = 0.3;
             MaxIterations = 50;
-            MaxTurnsToKeep = 3;
+            // 1M 上下文下压缩基本是反效果:重写历史 = 重写前缀 = 缓存全废,
+            // 省下的那点 token 远不如缓存折扣值钱。放宽到 40 轮,
+            // 真正的边界交给按窗口百分比的裁剪。
+            MaxTurnsToKeep = 40;
             SystemPrompt = DefaultSystemPrompt;
             AutoApproveTools = new HashSet<string>(StringComparer.Ordinal);
         }
@@ -82,6 +85,11 @@ namespace TxTools.Agent.Core
   某 API 在 IronPython 下不可用、调用前必须先做某步准备),立刻调 api_note 记录。
   下次任何对话查同一类型时会自动带出来。不要记录签名本身能看出来的信息。
 
+【run_csharp 专属】以下限制只对 run_csharp 沙箱成立（它用的是 CodeDom 传统编译器）：
+  无 $""...""、无 ?.、无 =>、var 不能推断 null…
+用 code_edit 改外部项目时不受此限制 —— 那边走 MSBuild/Roslyn，
+.NET Framework 4.8 项目默认 C# 7.3，具体看目标 csproj 的 LangVersion。
+
 ━━━ 铁律二:连续失败就停下换思路 ━━━
 同一工具连续失败 2 次后,禁止继续微调同一份代码 —— 大概率还是失败。改做这三件事之一:
   a) api_lookup 把真实签名核对清楚,是不是把方法名/参数/所属类型记错了;
@@ -89,6 +97,28 @@ namespace TxTools.Agent.Core
   c) 确认此路不通就换工具,或向用户说明卡在哪里、需要什么信息。
 系统会统计连续失败次数(编译失败、脚本异常都算),第 3 次起会强制提示换思路,
 第 6 次熔断中止整个任务。别把机会浪费在原地打转上。
+
+━━━ 铁律四：改别人的源码 ━━━
+【读】绝不整文件读。一个 3000 行的 .cs 整读要 4 万 token，读两个文件上下文就废了。
+  正确顺序：
+    1. open_workspace 打开项目根目录
+    2. code_search 定位 —— 找方法定义在哪、谁调用了它，一律用搜，不要靠猜文件名
+    3. code_outline 看目标文件骨架（百来行，含每个成员的行号）
+    4. code_read 只读需要的那一段（symbol=""方法名"" 或 start_line/end_line）
+
+【改】绝不输出整个新文件。用 code_edit 做精确串替换：
+  · old_string 必须在文件中恰好出现一次 —— 不唯一就往前后多带 1~3 行上下文
+  · old_string 必须与原文逐字节一致（含缩进）—— 先 code_read 读出来照抄，不要凭记忆写
+  · 一次只改一处。多处改动拆成多次调用，每次都能单独 review 和回滚
+
+【验】每次 code_edit 之后必须 code_build。
+  未经编译验证的改动不算完成 —— 看着对的 C# 代码经常编译不过。
+  有错误时按返回的行号 code_read 看上下文再修，不要凭错误消息猜。
+  同一处连续改两次仍不过，停下来重新读代码，别继续试。
+
+【范围】只改任务明确要求的部分。
+  顺手重命名、调整格式、""优化""无关代码 —— 一律不要做。
+  用户 review 的是你的改动，混进无关改动会让 review 失效。
 
 ━━━ 工具优先级(遇到任务先想:有没有专属工具?) ━━━
 【API 查询】api_lookup(查签名) / api_note(记坑)。见铁律一。
@@ -181,6 +211,10 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
   • 探查对象成员用 tx_dir(obj);但那只给成员名,查签名请用 api_lookup,别在这里绕
   • 用途定位:probe_python 查『场景里实际有什么』(选中了几个、名字是什么、当前值多少),
     不查『API 怎么用』
+
+━━━ 别心算 ━━━
+矩阵运算、坐标变换、欧拉角互转、大量数值比较，一律写进 probe_python 让它算，
+不要在思考过程里手工展开 —— 又慢又容易错，还会把输出预算烧光导致本轮无输出。
 
 ━━━ CEE 逻辑速查(Process Simulate 内置 PLC = Cyclic Event Evaluator) ━━━
 【核心概念】
@@ -302,6 +336,7 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
 
         public void Reset()
         {
+            InvalidateSystemPromptCache();   // 换对话 → 重新拉取记忆
             _messages.Clear();
             _fullHistory.Clear();
             TotalPromptTokens = 0;
@@ -752,7 +787,34 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
         /// 构建含记忆的系统提示 = DefaultSystemPrompt + FactsStore.TopN + GotchasStore.TopN。
         /// Snippet 改为每轮 SendAsync 里按需注入(完整代码),此处不再列名单,避免双重注入。
         /// </summary>
+        // ── 系统提示词缓存 ──
+        //
+        // 【为什么要缓存】系统提示词是 prompt 前缀的第一段。每轮重建的话,
+        // 本轮只要 add_fact 或触发一次 AutoGotcha,下一轮 TopN 就变了 → 前缀击穿 →
+        // 整个历史按未命中价重算(1元/M vs 缓存命中 0.02元/M,差 50 倍)。
+        // 所以会话内固定一份:新记的 fact/gotcha 下次对话才生效,这点延迟完全可以接受。
+        private static string _promptCache;
+        private static readonly object _promptSync = new object();
+
+        /// <summary>开新对话 / 切换对话时调用,让下一次构建重新拉取记忆。</summary>
+        public static void InvalidateSystemPromptCache()
+        {
+            lock (_promptSync) { _promptCache = null; }
+        }
+
         public static string BuildSystemPromptWithMemory()
+        {
+            lock (_promptSync)
+            {
+                if (_promptCache != null) return _promptCache;
+            }
+
+            var built = BuildSystemPromptCore();
+            lock (_promptSync) { _promptCache = built; }
+            return built;
+        }
+
+        private static string BuildSystemPromptCore()
         {
             var prompt = AgentOptions.DefaultSystemPrompt;
             var sb = new StringBuilder();

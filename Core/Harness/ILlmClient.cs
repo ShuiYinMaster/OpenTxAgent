@@ -19,7 +19,10 @@ namespace TxAgent.Core
         public LlmRequest()
         {
             Temperature = 0.2;
-            MaxTokens = 4096;
+            // 【别再设成 4096】推理模型的 reasoning_content 计入输出预算,
+            // 一段 7000 字的思考链就要 5000+ token —— 4096 会让模型思考到一半被截断,
+            // 返回 content 和 tool_calls 全空,表现为"任务未正常结束",极难定位。
+            MaxTokens = 16384;
         }
     }
 
@@ -40,6 +43,19 @@ namespace TxAgent.Core
         public int PromptTokens { get; set; }
 
         public int CompletionTokens { get; set; }
+
+        /// <summary>
+        /// API 返回的 finish_reason:stop / length / tool_calls / content_filter。
+        /// "length" 表示输出预算被耗尽 —— 这是空响应最常见的原因,必须能区分出来,
+        /// 否则只能笼统报"上下文过长",方向就找偏了。
+        /// </summary>
+        public string FinishReason { get; set; }
+
+        /// <summary>是否因为输出预算耗尽而被截断。</summary>
+        public bool Truncated
+        {
+            get { return string.Equals(FinishReason, "length", StringComparison.OrdinalIgnoreCase); }
+        }
 
         /// <summary>
         /// true 表示 Content / ReasoningContent 已在生成过程中通过回调逐块发出，

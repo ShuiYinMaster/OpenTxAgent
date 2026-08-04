@@ -154,6 +154,8 @@ namespace TxTools.Agent.Harness
             _fullHistory = new List<ChatMessage>();
             _workingMemory = new List<ChatMessage>();
             // [P1] 注入 Facts + Gotchas 到系统提示(复用旧引擎的 BuildSystemPromptWithMemory)
+            // 换对话 → 让系统提示词重新拉一次记忆(会话内则固定,保住前缀缓存)
+            TxTools.Agent.Core.AgentLoop.InvalidateSystemPromptCache();
             var sysPrompt = TxTools.Agent.Core.AgentLoop.BuildSystemPromptWithMemory();
             var sys = new ChatMessage("system", sysPrompt);
             _fullHistory.Add(sys);
@@ -201,24 +203,36 @@ namespace TxTools.Agent.Harness
 
             _inReasoning = false;
 
+            // 会话与基线提到 try 外面 —— 用户中途点停止时,
+            // RunAsync 会抛 OperationCanceledException,若这两个变量在 try 内声明,
+            // finally 里就拿不到它们,已经产生的助手回复和工具结果会连同异常一起丢掉。
+            AgentSession session = null;
+            int baseCount = 0;
+
             try
             {
                 // [P5] 历史压缩:超轮数时把旧消息压缩为摘要
                 CompressHistory();
 
                 // 2) 用当前工作记忆重建 harness 会话(每次重建,harness 自行裁剪)
-                var session = BuildSessionFromHistory();
+                session = BuildSessionFromHistory();
+
+                // 上下文预算按模型窗口的 70% 动态设定。
+                // 写死 48000 的话:窗口大的模型白白浪费,窗口小的模型根本挡不住 ——
+                // 而工具输出(一次场景 dump 可达 3 万 token)累积极快,不设边界必然溢出。
+                session.TokenBudget = (int)(ModelRouter.ContextWindowFor(_options.Model, ModelRouter.CurrentProviderId) * 0.70);
 
                 // 归档基线:本轮开始时会话里已有的消息数。
                 // RunAsync 之后,索引 >= baseCount 的才是本轮新产生的 assistant/tool 消息,
                 // 只把这些追加进 _fullHistory —— 基线之前的内容是压缩后的工作记忆,
                 // 拿它覆盖归档会把原始对话物理销毁。
-                int baseCount = session.Messages.Count;
+                baseCount = session.Messages.Count;
 
                 // 3) 组装并订阅 harness 循环
                 var loopOptions = new AgentLoopOptions
                 {
                     MaxIterations = Math.Max(1, _options.MaxIterations),
+                    MaxTokens = OutputBudgetFor(_options.Model),
                     ReadOnlyPhase = false,
                     AutoRestorePoint = true,
                     EnableStreaming = true
@@ -254,8 +268,7 @@ namespace TxTools.Agent.Harness
                     EndReasoningIfNeeded();
                 }
 
-                // 4) 把 harness 产生的新消息同步回旧格式历史
-                SyncHistoryFromSession(session, baseCount);
+                // 4) 归档同步在下方 finally 里统一做 —— 取消路径也要走到
 
                 // 5) 正文已由 ContentDelta 实时发出,这里只补一次完整文本事件供需要整段的订阅方
                 if (!string.IsNullOrEmpty(result.FinalMessage))
@@ -273,6 +286,18 @@ namespace TxTools.Agent.Harness
             }
             finally
             {
+                // 【无论正常结束、报错还是用户点停止,都要把本轮已产生的消息归档】
+                // 中途停止时,模型此前说过的话、调过的工具结果都已经在 session 里,
+                // 不同步的话界面上看得见、重开对话却没了。
+                if (session != null)
+                {
+                    try { SyncHistoryFromSession(session, baseCount); }
+                    catch (Exception ex)
+                    {
+                        try { AuditLog.Write("[warn] [Harness] 归档同步失败: " + ex.Message); } catch { }
+                    }
+                }
+
                 // [P4] 清掉本轮临时注入的 Snippet 消息。
                 // 注意不能用 Remove(snippetSysMsg) —— SyncHistoryFromSession 已经把
                 // _workingMemory 换成了新 List,按对象引用删是删不掉的,
@@ -556,6 +581,26 @@ namespace TxTools.Agent.Harness
                     return first + " " + content.Substring(nl + 1, nl2 - nl - 1).Trim();
             }
             return first;
+        }
+
+        /// <summary>
+        /// 单次响应的输出预算。
+        ///
+        /// 推理模型的思考链计入这个预算 —— 实测一次 7000 字的手工矩阵推导就要 5000+ token。
+        /// 给小了会在思考中途被截断,返回 content 和 tool_calls 全空,
+        /// 表现为"任务未正常结束",而真正的原因(finish_reason=length)完全看不出来。
+        /// 给大不花钱:只按实际生成量计费,预算只是上限。
+        /// </summary>
+        private static int OutputBudgetFor(string model)
+        {
+            var m = (model ?? "").ToLowerInvariant();
+
+            // 支持超长输出的新一代模型
+            if (m.Contains("deepseek-v4") || m.Contains("v4-flash") || m.Contains("v4-pro")) return 32768;
+            if (m.Contains("kimi-k3") || m.Contains("kimi-k2")) return 32768;
+            if (m.Contains("qwen3")) return 16384;
+
+            return 8192;
         }
 
         // ── 会话 <-> 历史 互转 ──

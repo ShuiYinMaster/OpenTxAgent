@@ -36,10 +36,24 @@ namespace TxTools.Agent.Core
             return _map.Remove(name ?? string.Empty);
         }
 
+        /// <summary>
+        /// 构造发给 API 的工具声明。
+        ///
+        /// 【顺序必须稳定】工具定义排在请求最前面,是 prompt 前缀的一部分。
+        /// Dictionary 的遍历顺序不保证(受插入顺序、扩容 rehash 影响),
+        /// 顺序一变整个前缀缓存就击穿 —— DeepSeek 缓存命中 0.02元/M vs 未命中 1元/M,
+        /// 差 50 倍。按 Name 排序,把顺序钉死。
+        /// </summary>
         public List<ToolDef> ToToolDefs()
         {
-            var list = new List<ToolDef>(_map.Count);
-            foreach (var t in _map.Values)
+            var ordered = new List<ITxAgentTool>(_map.Values);
+            ordered.Sort(delegate (ITxAgentTool a, ITxAgentTool b)
+            {
+                return string.CompareOrdinal(a.Name, b.Name);
+            });
+
+            var list = new List<ToolDef>(ordered.Count);
+            foreach (var t in ordered)
             {
                 // 安全网: function.name 必须匹配 ^[a-zA-Z0-9_-]+$。
                 // RecipeTool.Name 已做过净化, 此处兜底处理任何漏网的非 ASCII 工具名。
