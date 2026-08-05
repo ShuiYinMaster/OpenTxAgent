@@ -19,10 +19,13 @@ namespace TxAgent.Core
         public LlmRequest()
         {
             Temperature = 0.2;
-            // 【别再设成 4096】推理模型的 reasoning_content 计入输出预算,
+            // 【别设成 4096】推理模型的 reasoning_content 计入输出预算,
             // 一段 7000 字的思考链就要 5000+ token —— 4096 会让模型思考到一半被截断,
             // 返回 content 和 tool_calls 全空,表现为"任务未正常结束",极难定位。
-            MaxTokens = 16384;
+            //
+            // 【也别设太大】32768 那次的教训:模型陷入重复循环时有足够空间写满一万多 token。
+            // 12k 对思考链够用,而退化时能早点被掐掉。
+            MaxTokens = 12288;
         }
     }
 
@@ -50,6 +53,12 @@ namespace TxAgent.Core
         /// 否则只能笼统报"上下文过长",方向就找偏了。
         /// </summary>
         public string FinishReason { get; set; }
+
+        /// <summary>
+        /// 输出陷入重复循环时的纠正提示。非空表示本次生成被主动截断 ——
+        /// AgentLoop 应把它作为一条消息入会话，让模型换个做法，而不是当正常结束处理。
+        /// </summary>
+        public string RepetitionHint { get; set; }
 
         /// <summary>是否因为输出预算耗尽而被截断。</summary>
         public bool Truncated

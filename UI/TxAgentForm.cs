@@ -42,6 +42,11 @@ namespace TxTools.Agent.UI
         private DeepSeekClient _client;
         private IAgentLoop _loop;
 
+        // ── 多 PDPS:角色仲裁 + RPC 执行器 ──
+        // 无界面执行器由 TxAgentService 统一管理(插件加载即启动,与窗体无关)。
+        // 窗体只读角色:主控显示对话界面,执行器模式显示只读提示。
+        private bool _isBrain = true;
+
         /// <summary>
         /// 是否启用新 harness(TxAgent.Core)引擎。默认 false,保持原有 AgentLoop 行为不变。
         /// 改为 true 即切换到 HarnessAgentLoop(用新 harness 的 AgentLoop 驱动现有 26 个工具)。
@@ -154,23 +159,86 @@ namespace TxTools.Agent.UI
             try { SemiModal = false; } catch { }
         }
 
+        // ── 多 PDPS:角色仲裁 + RPC 执行器 ──
+        // 无界面执行器由 TxAgentService 统一管理(插件加载即启动,不依赖本窗体)。
+        // 这里只是幂等地刷一次心跳,并读取本进程角色,决定显示对话还是执行器提示。
+        private void InitMultiPds()
+        {
+            try
+            {
+                TxAgentService.Start(_tools);       // 幂等:已启动则只刷心跳
+                _isBrain = TxAgentService.IsBrain;
+            }
+            catch (Exception ex)
+            {
+                try { AuditLog.Write("[warn] [MultiPds] 初始化失败: " + ex.Message); } catch { }
+            }
+        }
+
         protected override void OnLoad(EventArgs e)
         {
             base.OnLoad(e);
             FormUiKit.ApplyDpiScaling(this, ref _dpiApplied, DesignSize);
             _loadingTimer.Start();
+            InitMultiPds();
             InitWebViewAsync();
-            InitKnowledgeIndexAsync();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            // 注:TxAgentService(执行器)生命周期 = 进程,关窗不停止 ——
+            // 本进程可能正作为被控端被主控调用,残留项由心跳 TTL(45s)自动清理。
+            CleanupWebViewProfile();             // 清掉本进程的 WebView2 缓存目录
+
             // 若正等审批,视为拒绝解除阻塞,让后台线程能退出
             ReleasePendingApproval(false);
             FireExtractLessons();                // 关窗前对当前对话跑一次经验萃取
             try { UploadStore.ClearAll(); } catch { }
             AgentLoop.Current = null;
             base.OnFormClosed(e);
+        }
+
+        /// <summary>
+        /// 建一个进程独占的 WebView2 环境。目录带 PID，多个 PDPS 互不干扰。
+        /// 失败时返回 null —— 调用方退回默认行为，单进程场景仍然可用。
+        /// </summary>
+        private static async System.Threading.Tasks.Task<Microsoft.Web.WebView2.Core.CoreWebView2Environment>
+            CreateWebViewEnvironmentAsync()
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(),
+                    "TxAgent.WebView",
+                    System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+
+                System.IO.Directory.CreateDirectory(dir);
+
+                return await Microsoft.Web.WebView2.Core.CoreWebView2Environment
+                    .CreateAsync(null, dir, null);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[TxAgent] 创建独立 WebView2 环境失败,回退默认: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>关窗时清掉本进程的 WebView2 缓存目录，避免 %TEMP% 越堆越多。</summary>
+        private static void CleanupWebViewProfile()
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(), "TxAgent.WebView",
+                    System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+
+                // 进程还没退出，WebView2 可能仍占着文件，删不掉就算了 ——
+                // 下次同 PID 复用时会被覆盖，不会无限增长
+                if (System.IO.Directory.Exists(dir))
+                    System.IO.Directory.Delete(dir, true);
+            }
+            catch { }
         }
 
         // ─────────────────────────────────────────────────────
@@ -181,7 +249,12 @@ namespace TxTools.Agent.UI
         {
             try
             {
-                await _webView.EnsureCoreWebView2Async(null);
+                // 【必须给每个进程独立的用户数据目录】
+                // 传 null 时 WebView2 按 exe 名推导默认目录,两个 PDPS 是同一个 exe,
+                // 于是抢同一个目录 —— 而 WebView2 对它是【独占锁】,
+                // 第二个进程会一直卡在 EnsureCoreWebView2Async 不返回,
+                // 界面就停在"正在加载 TxAgent UI …"。
+                await _webView.EnsureCoreWebView2Async(CreateWebViewEnvironmentAsync().Result);
                 try { _webView.CoreWebView2.Settings.AreDevToolsEnabled = true; } catch { }
                 try { _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true; } catch { }
                 try { _webView.CoreWebView2.Settings.IsWebMessageEnabled = true; } catch { }
@@ -253,50 +326,6 @@ namespace TxTools.Agent.UI
                     "https://developer.microsoft.com/microsoft-edge/webview2/" + Environment.NewLine +
                     "下载 Evergreen Runtime 后重试。");
             }
-        }
-
-        /// <summary>
-        /// 知识库向量化初始化:配置嵌入器 + 后台增量重建索引(不卡 UI)。
-        /// 云端(DashScope)零部署、按量计费;本地 ONNX 有模型文件时用 AutoSelect 可自动优先。
-        /// 没配 qwen key 且无本地模型 → Embedder 为 null,search_knowledge 自动退回纯关键字。
-        /// </summary>
-        private void InitKnowledgeIndexAsync()
-        {
-            try
-            {
-                // MD 推荐先跑云端验证效果;要切本地 ONNX 时改成 KnowledgeIndex.AutoSelect()
-                KnowledgeIndex.Embedder = DashScopeEmbedder.TryCreate();
-            }
-            catch (Exception ex)
-            {
-                try { AuditLog.Write("[warn] [Embed] 嵌入器初始化失败: " + ex.Message); } catch { }
-                KnowledgeIndex.Embedder = null;
-            }
-
-            if (KnowledgeIndex.Embedder == null)
-            {
-                PostStatus("知识库向量检索未启用(未配置 qwen key)——search_knowledge 走纯关键字。");
-                return;
-            }
-
-            if (KnowledgeStore.IsEmpty)
-            {
-                PostStatus("知识库为空，跳过向量索引。放 .md 到 " + KnowledgeStore.FolderPath() + " 后重开生效。");
-                return;
-            }
-
-            PostStatus("正在构建知识库向量索引…");
-            Task.Run(async () =>
-            {
-                try
-                {
-                    await KnowledgeIndex.BuildAsync(CancellationToken.None, msg => PostStatus(msg));
-                }
-                catch (Exception ex)
-                {
-                    try { AuditLog.Write("[warn] [Embed] 索引构建失败: " + ex.Message); } catch { }
-                }
-            });
         }
 
         /// <summary>
@@ -424,6 +453,10 @@ namespace TxTools.Agent.UI
                             break;
                         }
 
+                    case "openPath":
+                        HandleOpenPath((string)msg["path"]);
+                        break;
+
                     case "askUserResponse":
                         {
                             // 用户答复了 ask_user 弹窗。cancelled 时 answer 传 null
@@ -488,6 +521,17 @@ namespace TxTools.Agent.UI
         private void OnJsReady()
         {
             _webViewReady = true;
+
+            // 执行器模式:本窗口不是主控,禁用对话输入,提示用户去主控窗口操作
+            if (!_isBrain)
+            {
+                var brain = PsInstanceRegistry.Brain();
+                var hint = "本窗口为执行器模式,已接入主控(pid "
+                         + (brain != null ? brain.Pid.ToString() : "未知") + "),"
+                         + "对话请在主控窗口进行。";
+                PostJs(new { type = "executor", hint });
+                return;
+            }
 
             // 隐藏加载遮罩,让 WebView 显示出来
             try
@@ -642,8 +686,66 @@ namespace TxTools.Agent.UI
         /// 分项是按字符数估算的(中英文混排取 2 字符≈1 token),不是 API 精确计数 ——
         /// 页面上已标注"估算值",用途是让用户知道该压缩哪一块,不用于计费。
         /// </summary>
+        /// <summary>
+        /// 打开前端点击的文件路径。
+        ///
+        /// 文件存在 → 在资源管理器里【选中】它(/select),而不是直接执行 ——
+        /// 直接 Process.Start 一个 .exe/.bat 就等于替用户运行未知程序,风险不对等。
+        /// 目录存在 → 打开该目录。
+        /// 都不存在 → 退到最近的存在的上级目录,并说明原因;
+        /// 模型给出的路径经常是"将要生成"而不是"已经生成"的。
+        /// </summary>
+        private void HandleOpenPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+
+            try
+            {
+                var p = path.Trim().Trim('"');
+
+                if (System.IO.File.Exists(p))
+                {
+                    System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + p + "\"");
+                    PostStatus("已在资源管理器中定位: " + System.IO.Path.GetFileName(p));
+                    return;
+                }
+
+                if (System.IO.Directory.Exists(p))
+                {
+                    System.Diagnostics.Process.Start("explorer.exe", "\"" + p + "\"");
+                    PostStatus("已打开目录: " + p);
+                    return;
+                }
+
+                // 逐级上溯找一个存在的目录
+                var dir = p;
+                for (int i = 0; i < 6; i++)
+                {
+                    dir = System.IO.Path.GetDirectoryName(dir);
+                    if (string.IsNullOrEmpty(dir)) break;
+                    if (System.IO.Directory.Exists(dir))
+                    {
+                        System.Diagnostics.Process.Start("explorer.exe", "\"" + dir + "\"");
+                        PostStatus("文件不存在，已打开上级目录: " + dir);
+                        return;
+                    }
+                }
+
+                PostStatus("路径不存在: " + p);
+            }
+            catch (Exception ex)
+            {
+                PostStatus("打开失败: " + ex.Message);
+            }
+        }
+
         private void PostTokenUsage(int p, int c, int t)
         {
+            // 入参来自当前 loop,加上基线才是本会话的真实累计
+            p = _baseP + (_loop != null ? _loop.TotalPromptTokens : 0);
+            c = _baseC + (_loop != null ? _loop.TotalCompletionTokens : 0);
+            t = p + c;
+
             int sysTok = 0, msgTok = 0, toolTok = 0;
 
             try
@@ -1070,15 +1172,21 @@ namespace TxTools.Agent.UI
             else StartFreshConversation();
         }
 
+        // 会话累计用量的基线:本次打开之前已经花掉的部分。
+        // 实际显示值 = 基线 + 当前 loop 的计数,这样切走再切回来不会归零。
+        private int _baseP, _baseC;
+
         private void StartFreshConversation()
         {
             _current = new Conversation { Id = ConversationStore.NewId(), CreatedUtc = DateTime.UtcNow };
+            _baseP = 0; _baseC = 0;
             if (_loop != null)
             {
                 _loop.SetConvId(_current.Id);
                 _loop.Reset();
             }
             PostJs(new { type = "clear" });
+            PostTokenUsage(0, 0, 0);   // 立即清零,别等第一轮对话才刷新
             PostJs(new { type = "message", role = "\u7cfb\u7edf", text = "\u5df2\u5c31\u7eea\uff0c\u53ef\u4ee5\u5f00\u59cb\u5bf9\u8bdd\u3002" });
         }
 
@@ -1087,12 +1195,15 @@ namespace TxTools.Agent.UI
             var conv = ConversationStore.Load(id);
             if (conv == null) { StartFreshConversation(); return; }
             _current = conv;
+            _baseP = conv.PromptTokens;
+            _baseC = conv.CompletionTokens;
             if (_loop != null)
             {
                 _loop.SetConvId(id);
                 _loop.LoadHistory(conv.Messages);
             }
             RestoreTranscriptToJs(conv.Messages);
+            PostTokenUsage(0, 0, 0);   // 载入后立刻把累计值推给前端
         }
 
         private void SaveCurrent()
@@ -1100,6 +1211,8 @@ namespace TxTools.Agent.UI
             if (_loop == null || _current == null) return;
             if (!ConversationStore.HasUserContent(_loop.FullHistory)) return;
             _current.Messages = new List<ChatMessage>(_loop.FullHistory);
+            _current.PromptTokens = _baseP + _loop.TotalPromptTokens;
+            _current.CompletionTokens = _baseC + _loop.TotalCompletionTokens;
             try { ConversationStore.Save(_current); } catch { }
         }
 

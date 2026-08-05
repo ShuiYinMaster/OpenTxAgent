@@ -122,11 +122,21 @@ namespace TxTools.Agent.Harness
             }
             catch { }
 
+            // 从持久化设置恢复工具组开关(没有保存过则用 ToolGate 代码默认值)
+            TxTools.Agent.Core.ToolGate.RestoreFromPrefs();
+
             // 把所有现有工具包成 ITool(事件由 Core 直接抛,不需要 Tracing 装饰器)
+            // 按 ToolGate 组过滤:未启用组的工具不注册,模型看不到、也不占 prompt 前缀。
             _harnessReg = new TxAgent.Core.ToolRegistry();
             foreach (var t in _tools.Tools)
             {
                 if (t == null) continue;
+                if (!TxTools.Agent.Core.ToolGate.ShouldExpose(t.Name))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        "[TxAgent.Harness] 工具被 ToolGate 挡下(组未启用): " + (t.Name ?? "?"));
+                    continue;
+                }
                 var adapter = new TxAgentToolAdapter(t, _host, () => _currentConvId); // [P3] 传入 convId 供 AutoGotcha
                 try { _harnessReg.Register(adapter); }
                 catch (Exception ex)
@@ -157,6 +167,12 @@ namespace TxTools.Agent.Harness
             // 换对话 → 让系统提示词重新拉一次记忆(会话内则固定,保住前缀缓存)
             TxTools.Agent.Core.AgentLoop.InvalidateSystemPromptCache();
             var sysPrompt = TxTools.Agent.Core.AgentLoop.BuildSystemPromptWithMemory();
+
+            // 工具组开关说明:告诉模型哪些能力当前被禁用,避免它反复尝试不可用工具
+            var gateNote = TxTools.Agent.Core.ToolGate.DescribeDisabled();
+            if (!string.IsNullOrEmpty(gateNote))
+                sysPrompt = sysPrompt.TrimEnd() + "\n\n" + gateNote;
+
             var sys = new ChatMessage("system", sysPrompt);
             _fullHistory.Add(sys);
             _workingMemory.Add(sys);
@@ -590,15 +606,17 @@ namespace TxTools.Agent.Harness
         /// 给小了会在思考中途被截断,返回 content 和 tool_calls 全空,
         /// 表现为"任务未正常结束",而真正的原因(finish_reason=length)完全看不出来。
         /// 给大不花钱:只按实际生成量计费,预算只是上限。
+        /// 【别贪大】模型陷入重复循环时,预算有多大就烧多少 ——
+        /// 实测 32768 让一次退化烧掉一万多 token。12k 对思考链已经够用。
         /// </summary>
         private static int OutputBudgetFor(string model)
         {
             var m = (model ?? "").ToLowerInvariant();
 
             // 支持超长输出的新一代模型
-            if (m.Contains("deepseek-v4") || m.Contains("v4-flash") || m.Contains("v4-pro")) return 32768;
-            if (m.Contains("kimi-k3") || m.Contains("kimi-k2")) return 32768;
-            if (m.Contains("qwen3")) return 16384;
+            if (m.Contains("deepseek-v4") || m.Contains("v4-flash") || m.Contains("v4-pro")) return 12288;
+            if (m.Contains("kimi-k3") || m.Contains("kimi-k2")) return 12288;
+            if (m.Contains("qwen3")) return 12288;
 
             return 8192;
         }

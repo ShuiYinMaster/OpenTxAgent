@@ -15,6 +15,14 @@
 //
 // provider id 与 LlmProviders / KeyStore 完全一致(deepseek / kimi / qwen / openai / ollama),
 // BaseUrl 一律从 LlmProviders 取,本文件不再各存一份端点。
+//
+// 【百炼的 base_url 有讲究】通用端点 https://dashscope.aliyuncs.com/compatible-mode
+// 和业务空间专属端点是两回事:
+//     https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode
+// API Key 与地域强绑定,base_url 必须和 key 的地域一致。
+// 代理的三方模型(deepseek / kimi / glm)在通用端点上可能是降级处理 ——
+// 疑似 tool_calls 解析不出来的成因之一。
+// 若 key 是业务空间下发的,请把 LlmProviders 里 qwen 的 BaseUrl 改成专属端点。
 
 using System;
 using System.Collections.Generic;

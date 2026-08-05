@@ -23,7 +23,20 @@ namespace TxTools.Agent.Core
             if (tool == null) throw new ArgumentNullException(nameof(tool));
             if (string.IsNullOrWhiteSpace(tool.Name))
                 throw new ArgumentException("工具必须有非空的 Name。");
-            _map[tool.Name] = tool; // 同名后注册者覆盖
+
+            // 同名后注册者覆盖。这在配方(save_recipe 动态生成工具)撞上内置工具名时
+            // 会【静默替换】—— 内置工具凭空消失，排查起来毫无头绪。
+            // 覆盖行为保留(有时确实想覆盖)，但必须留下痕迹。
+            ITxAgentTool existing;
+            if (_map.TryGetValue(tool.Name, out existing) && !ReferenceEquals(existing, tool))
+            {
+                var msg = "[ToolRegistry] 工具名重复注册: \"" + tool.Name + "\"，"
+                        + existing.GetType().Name + " 被 " + tool.GetType().Name + " 覆盖。";
+                System.Diagnostics.Debug.WriteLine(msg);
+                try { AuditLog.Write("[warn] " + msg); } catch { }
+            }
+
+            _map[tool.Name] = tool;
         }
 
         public bool TryGet(string name, out ITxAgentTool tool)

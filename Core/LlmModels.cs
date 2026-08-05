@@ -28,6 +28,44 @@ namespace TxTools.Agent.Core
         /// </summary>
         [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
         public StreamOptions StreamOptions { get; set; }
+
+        /// <summary>
+        /// 百炼特有:是否启用思考模式。null = 不发送该字段(用服务端默认)。
+        ///
+        /// 【工具调用场景务必置 false】百炼官方示例在 function calling 里显式传
+        /// extra_body={"enable_thinking": False},不是随手写的 ——
+        /// 思考模式下代理层对 DeepSeek 系模型的输出解析会出问题,表现为两个症状:
+        ///   · &lt;/think&gt; 标签原样漏进 content
+        ///   · tool_calls 解析不出来,模型只能在正文里"口述"要调什么工具
+        /// 两者是同一个解析器的两个失败面,关掉思考通常一起消失。
+        /// </summary>
+        [JsonProperty("enable_thinking", NullValueHandling = NullValueHandling.Ignore)]
+        public bool? EnableThinking { get; set; }
+
+        /// <summary>
+        /// 是否允许一轮里并行发多个工具调用。null = 用服务端默认(通常是允许)。
+        ///
+        /// 允许并行能省轮次(实测模型会一次发两个 query_scene 查不同 scope),
+        /// 但每个写操作都要弹一次审批 —— 连弹几次体验很差。
+        /// 觉得烦就置 false 强制串行。
+        /// </summary>
+        [JsonProperty("parallel_tool_calls", NullValueHandling = NullValueHandling.Ignore)]
+        public bool? ParallelToolCalls { get; set; }
+
+        /// <summary>
+        /// 重复惩罚。对已出现过的 token 降权，抑制退化循环。
+        ///
+        /// 【为什么需要】长上下文 + 宽松输出预算下，模型会陷入自我强化的重复:
+        /// 同一句"让我发送脚本"连写七八十遍，一口气烧掉一万多 token。
+        /// 这是通用失败模式，官方端点同样会出现，不是某家代理的问题。
+        /// 0.3 左右足够抑制，再大会影响正常的术语复用(代码里同一个变量名要反复出现)。
+        /// </summary>
+        [JsonProperty("frequency_penalty", NullValueHandling = NullValueHandling.Ignore)]
+        public double? FrequencyPenalty { get; set; }
+
+        /// <summary>话题重复惩罚。与 FrequencyPenalty 配合，鼓励换个说法而不是原地打转。</summary>
+        [JsonProperty("presence_penalty", NullValueHandling = NullValueHandling.Ignore)]
+        public double? PresencePenalty { get; set; }
     }
 
     public sealed class StreamOptions

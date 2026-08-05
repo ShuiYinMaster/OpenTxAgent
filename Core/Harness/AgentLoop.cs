@@ -98,6 +98,12 @@ namespace TxAgent.Core
         /// </summary>
         private readonly StringBuilder _partial = new StringBuilder();
 
+        /// <summary>本次运行累计触发重复循环的次数。</summary>
+        private int _repetitionStrikes;
+
+        /// <summary>连续几次重复就放弃。给两次机会足够 —— 三次还在转说明任务本身有问题。</summary>
+        private const int MaxRepetitionStrikes = 3;
+
         public AgentLoop(ILlmClient llm, ToolRegistry registry, IAgentHost host, AgentLoopOptions options)
         {
             if (llm == null) throw new ArgumentNullException("llm");
@@ -170,6 +176,7 @@ namespace TxAgent.Core
         {
             var result = new AgentRunResult();
             _partial.Length = 0;
+            _repetitionStrikes = 0;
             var failureCounter = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             RestorePoint restorePoint = null;
 
@@ -230,6 +237,31 @@ namespace TxAgent.Core
                     _host.Log("warn", "模型返回空内容且无工具调用，已丢弃该轮消息以免污染历史");
                 }
 
+                // 输出陷入重复循环，客户端已主动截断。
+                // 【不能当正常结束】那一大坨重复文字不是答案。
+                // 把纠正提示作为一条 user 消息入会话，让模型换个做法继续 ——
+                // 用 user 角色而不是 tool，因为这不是某个工具的返回，
+                // 而是对模型行为本身的干预。
+                if (!string.IsNullOrEmpty(response.RepetitionHint))
+                {
+                    _repetitionStrikes++;
+
+                    _host.Log("warn", "第 " + _repetitionStrikes + " 次检测到重复循环");
+
+                    if (_repetitionStrikes >= MaxRepetitionStrikes)
+                    {
+                        result.Completed = false;
+                        result.StopReason = "模型连续 " + _repetitionStrikes
+                            + " 次陷入重复循环，已中止。当前这一步可能超出了模型的处理能力 —— "
+                            + "建议把任务拆小，或把中间数据写成文件再读，不要在对话里搬运。";
+                        result.RestorePoint = restorePoint;
+                        return result;
+                    }
+
+                    session.AddUser(response.RepetitionHint);
+                    continue;   // 不结束，让它重来一轮
+                }
+
                 // 没有工具调用 = 模型认为任务结束
                 if (!response.HasToolCalls)
                 {
@@ -253,10 +285,35 @@ namespace TxAgent.Core
                     return result;
                 }
 
+                // 本轮已执行过的 (工具名 + 参数)。只在轮内去重 ——
+                // 跨轮相同调用往往是合理的（先查一次、改完再查一次核对）。
+                var doneThisTurn = new HashSet<string>(StringComparer.Ordinal);
+
                 foreach (var call in response.ToolCalls)
                 {
                     ct.ThrowIfCancellationRequested();
                     result.ToolCallCount++;
+
+                    // 参数不同的并行调用是合理的（同一工具查不同 scope），不能一起挡掉，
+                    // 所以键必须带上参数，只挡完全一样的那种。
+                    var dedupKey = (call.Name ?? "") + "|" + (call.ArgumentsJson ?? "");
+                    if (!doneThisTurn.Add(dedupKey))
+                    {
+                        _host.Log("warn", "跳过本轮重复调用: " + call.Name);
+                        session.Add(ChatMessage.CreateToolResult(call.Id,
+                            "跳过:本轮已经用完全相同的参数调用过 " + call.Name + "，"
+                            + "结果见上一条。不要重复发同一个调用。"));
+                        continue;
+                    }
+
+                    // 参数 JSON 残缺最常见的原因是输出预算耗尽，不是模型写错。
+                    // 上一轮 finish_reason=length 时尤其可疑 —— 明确说出来，
+                    // 否则模型会以为格式写错了，原样重发一遍再次被截断。
+                    if (response.Truncated && !string.IsNullOrEmpty(call.ArgumentsJson))
+                    {
+                        _host.Log("warn", "本轮被 max_tokens 截断，工具 "
+                            + call.Name + " 的参数可能不完整");
+                    }
 
                     var tool = _registry.Find(call.Name);
 

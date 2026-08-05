@@ -156,6 +156,12 @@ namespace TxTools.Agent.Core
    优先用 ask_user 弹窗(confirm/choice/input 三种),用户一次点击即回复,
    比说一句话等用户到输入框打字高效得多。
    例: 8000 焊点重命名前 confirm; 品牌选择 choice(Fanuc/KUKA/ABB); 批次号 input。
+【多环境】可能同时开着多个 PDPS,每个算一个""环境""。涉及「另一个窗口」「另一个工作站」
+   「两边对比」时,先 list_environments 拿到环境名。
+   · 在别的环境里查东西 → run_in_environment
+   · 两边比对同一个对象 → compare_environments(它会自动标出差异行)
+   跨环境【只能读不能写】。用户要求改另一个环境时,
+   说明需要他切到那个窗口自己操作 —— 不要试图绕过。
 【兜底】没有现成工具时:api_lookup 查清签名 → run_csharp 写代码。run_csharp 是兜底,优先用现成工具。
 
 ━━━ 运行期行为坑(签名看不出来,必须知道) ━━━
@@ -201,6 +207,9 @@ namespace TxTools.Agent.Core
 • log() 和 return 在方法体内直接可用。
 • 花括号必须配对,每写 { 立刻写对应 }。
 • 提交前对照上述规则逐条自查。一次编译失败 = 浪费一轮迭代 + 大量 token。
+【中间数据落盘】需要跨步骤携带的结构化数据（坐标表、映射关系、对象清单），
+  一律写成文件再读，不要在对话里逐条罗列 —— 几十行以上的数据放在上下文里
+  既占篇幅又容易抄错，而且极易让你在反复核对中陷入空转。
 
 ━━━ probe_python / IronPython 纪律 ━━━
 probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下最常翻车:

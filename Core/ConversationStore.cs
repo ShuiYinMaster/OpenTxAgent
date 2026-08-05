@@ -27,6 +27,15 @@ namespace TxTools.Agent.Core
         public string Title { get; set; }
         public DateTime CreatedUtc { get; set; }
         public DateTime UpdatedUtc { get; set; }
+
+        /// <summary>
+        /// 本会话累计 token 用量。持久化的原因:AgentLoop 的计数器随实例存活,
+        /// 重开对话就归零 —— 但用户看到的应该是"这个会话到目前为止一共花了多少",
+        /// 而不是"本次打开之后花了多少"。
+        /// </summary>
+        public int PromptTokens { get; set; }
+        public int CompletionTokens { get; set; }
+
         public List<ChatMessage> Messages { get; set; }
 
         public Conversation() { Messages = new List<ChatMessage>(); }

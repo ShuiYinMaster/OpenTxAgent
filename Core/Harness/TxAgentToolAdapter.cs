@@ -74,16 +74,36 @@ namespace TxTools.Agent.Harness
             JObject input;
             try
             {
+                // 无参工具有的模型发 ""，有的发 "{}"，都当空对象
                 input = string.IsNullOrWhiteSpace(argumentsJson)
                     ? new JObject()
                     : JObject.Parse(argumentsJson);
             }
             catch (Exception ex)
             {
-                return ToolResult.Fail("arg",
-                    "工具参数不是合法 JSON: " + ex.Message +
-                    "\n收到的内容: " + Truncate(argumentsJson, 400) +
-                    "\n请按 schema 重新构造参数。");
+                // 参数 JSON 残缺最常见的原因不是模型写错，而是【输出预算耗尽被截断】——
+                // 参数正在流式输出时撞上 max_tokens，就会得到半截 JSON。
+                // 报"格式错误"会让模型以为是自己写错了，然后原样重发一遍再次被截断。
+                // 所以要能区分出来，并给出正确的处置方式:拆小、少传。
+                bool looksTruncated = LooksTruncated(argumentsJson);
+
+                var msg = new StringBuilder();
+                msg.Append("工具参数不是合法 JSON: ").AppendLine(ex.Message);
+                msg.Append("收到的内容: ").AppendLine(Truncate(argumentsJson, 400));
+
+                if (looksTruncated)
+                {
+                    msg.AppendLine("【这段 JSON 看起来是被截断的，不是写错了】");
+                    msg.AppendLine("多半是参数太长，输出预算在中途耗尽。不要原样重发 —— 会再次被截断。");
+                    msg.Append("请把参数改小:代码类工具把脚本拆成几段分次执行；");
+                    msg.Append("批量类工具减少一次处理的对象数。");
+                }
+                else
+                {
+                    msg.Append("请按 schema 重新构造参数。");
+                }
+
+                return ToolResult.Fail("arg", msg.ToString());
             }
 
             try
@@ -161,6 +181,40 @@ namespace TxTools.Agent.Harness
                 }
             }
             return reg;
+        }
+
+        /// <summary>
+        /// 判断这段 JSON 像不像"被截断"而非"写错"。
+        /// 判据:开头合法、括号没配平、且结尾停在一个不该停的位置。
+        /// </summary>
+        private static bool LooksTruncated(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return false;
+
+            var t = json.TrimStart();
+            if (!t.StartsWith("{") && !t.StartsWith("[")) return false;
+
+            int curly = 0, square = 0;
+            bool inStr = false;
+
+            for (int i = 0; i < json.Length; i++)
+            {
+                var c = json[i];
+                if (inStr)
+                {
+                    if (c == '\\') i++;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '{') curly++;
+                else if (c == '}') curly--;
+                else if (c == '[') square++;
+                else if (c == ']') square--;
+            }
+
+            // 括号没闭合 或 停在字符串中间 → 截断
+            return curly > 0 || square > 0 || inStr;
         }
 
         // ── 输出截断 ──

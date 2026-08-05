@@ -91,6 +91,10 @@ namespace TxTools.Agent.Harness
             {
                 var req = BuildRequest(request, true);
                 TokenUsage usage = null;
+                string repetitionHint = null;
+
+                // 检测到退化循环时客户端已主动截断，这里把纠正提示带回给 AgentLoop
+                _client.OnRepetitionDetected = h => { repetitionHint = h; };
 
                 ChatMessage msg = await _client.SendStreamAsync(
                     req,
@@ -104,6 +108,7 @@ namespace TxTools.Agent.Harness
                     return LlmResponse.Error("流式返回空消息。");
 
                 var outResp = BuildResponse(msg, true);
+                outResp.RepetitionHint = repetitionHint;
                 if (usage != null)
                 {
                     outResp.PromptTokens = usage.PromptTokens;
@@ -136,17 +141,52 @@ namespace TxTools.Agent.Harness
 
         // ── 请求组装 ──
 
+        /// <summary>
+        /// 工具调用时是否关闭思考模式(百炼的 enable_thinking 参数)。
+        ///
+        /// 【默认 false】曾经怀疑思考模式导致 tool_calls 解析失败,后来抓原始 SSE 报文
+        /// 证明与它无关 —— 真正的原因是续片里的空串把工具名覆盖了(已修)。
+        /// 思考模式对复杂任务的规划质量有帮助,没有证据就不该关掉它。
+        /// 若将来确实遇到某个端点必须关思考才能调工具,把它置 true。
+        /// </summary>
+        public bool DisableThinkingWithTools { get; set; } = false;
+
+        /// <summary>
+        /// 是否允许并行工具调用。null = 不发送该字段。
+        /// 置 false 可避免"一轮弹好几次审批"，代价是多花几轮。
+        /// </summary>
+        public bool? ParallelToolCalls { get; set; }
+
+        /// <summary>重复惩罚。null 则不发送。默认 0.3 —— 见 ChatRequest.FrequencyPenalty 的说明。</summary>
+        public double? FrequencyPenalty { get; set; } = 0.3;
+
+        public double? PresencePenalty { get; set; } = 0.3;
+
         private ChatRequest BuildRequest(LlmRequest request, bool stream)
         {
-            return new ChatRequest
+            var tools = TranslateTools(request.Tools);
+
+            var req = new ChatRequest
             {
                 Model = ModelId,
                 MaxTokens = Math.Max(1, request.MaxTokens),
                 Temperature = request.Temperature,
                 Stream = stream,
                 Messages = TranslateMessages(request.Messages),
-                Tools = TranslateTools(request.Tools)
+                Tools = tools
             };
+
+            // 只在真的带工具时关思考:纯对话轮次让模型正常思考,质量更好
+            if (DisableThinkingWithTools && tools != null && tools.Count > 0)
+                req.EnableThinking = false;
+
+            if (ParallelToolCalls.HasValue && tools != null && tools.Count > 0)
+                req.ParallelToolCalls = ParallelToolCalls;
+
+            req.FrequencyPenalty = FrequencyPenalty;
+            req.PresencePenalty = PresencePenalty;
+
+            return req;
         }
 
         // ── 响应翻译 ──
