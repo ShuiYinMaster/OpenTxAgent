@@ -1263,9 +1263,15 @@ button { font-family: inherit; }
 ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
 </style>
+<link rel="stylesheet" href="recipe-sidebar.css">
 </head>
 
 <body>
+
+<!-- 配方侧边栏:横向 flex 容器。聊天区 #app 与侧边栏做兄弟,min-width:0 不能省 ——
+     flex 子项默认 min-width:auto,聊天区一条长消息不换行就会把侧边栏挤出可视区。 -->
+<div id="shell" style="display:flex; height:100vh; overflow:hidden;">
+<div id="app" style="flex:1 1 auto; min-width:0; display:flex; flex-direction:column;">
 
 <div id="topbar">
     <span class="brand">TxAgent</span>
@@ -1367,7 +1373,6 @@ button { font-family: inherit; }
 <div id="status-bar">
     <span id="status-text">初始化中...</span>
 </div>
-<div id="executor-hint" style="display:none; padding:10px 14px; background:#fff7ed; color:#9a3412; font-size:12px; line-height:1.5;"></div>
 
 <!-- Drop overlay -->
 <div id="drop-overlay">
@@ -1506,7 +1511,7 @@ window.dispatchMessage = function (json) {
         case "toolCall":       onToolCall(msg.name, msg.input); break;
         case "toolResult":     onToolResult(msg.name, msg.result, msg.isErr); break;
         case "status":         onStatus(msg.text); break;
-        case "executor":       onExecutorMode(msg.hint); break;
+        case "userTextPrefill": onUserTextPrefill(msg.text); break;
         case "busy":           onBusy(msg.value); break;
         case "tokenUsage":     onTokenUsage(msg); break;
         case "attachmentInfo": onAttachmentInfo(msg); break;
@@ -1524,10 +1529,15 @@ window.dispatchMessage = function (json) {
 // ═════════════════════════════════════════════════════════════════
 document.getElementById("model-select").addEventListener("change", (e) => {
     const opt = e.target.selectedOptions[0];
-    if (opt && opt.dataset.providerId) {
-        state.currentProviderId = opt.dataset.providerId;
-    }
-    postToHost({ type: "switchModel", model: e.target.value });
+    if (!opt) return;
+
+    // 【必须把 providerId 一起发过去】只发模型名的话，C# 侧遇到
+    // "deepseek-v4-flash" 这种跨 provider 同名模型只能猜，必然串。
+    const providerId = opt.dataset.providerId || state.currentProviderId;
+    const model = opt.dataset.model || opt.value;
+
+    state.currentProviderId = providerId;
+    postToHost({ type: "switchModel", model: model, providerId: providerId });
 });
 // ═════════════════════════════════════════════════════════════════
 //  权限档位 (原顶栏下拉,现为输入卡片内的按钮 + 菜单)
@@ -1750,18 +1760,33 @@ function onModelList(items, current, providers, currentProvider) {
     if (providers && providers.length > 0) {
         state.providers = providers;
         state.currentProviderId = currentProvider || providers[0].id;
+        // 【option 的 value 必须带 provider】
+        // 同一个模型名会同时出现在多个 provider 下(百炼代理了 deepseek/kimi)。
+        // value 只写模型名的话:
+        //   · 恢复选中时 "m === current" 会把两个同名项都标 selected，
+        //     浏览器只保留最后一个 —— 于是永远落在最后那个 provider 上；
+        //   · change 事件里 e.target.value 也分不出是哪个组点的。
+        // 用 "provider|model" 复合键，两个问题一起消失。
         for (const p of providers) {
             const g = document.createElement("optgroup");
             g.label = p.displayName + (p.isLocal ? "  (\u672c\u5730)" : "");
             for (const m of (p.models || [])) {
                 const opt = document.createElement("option");
-                opt.value = m;
+                opt.value = p.id + "|" + m;
                 opt.textContent = m;
                 opt.dataset.providerId = p.id;
-                if (m === current) opt.selected = true;
+                opt.dataset.model = m;
+                if (m === current && p.id === state.currentProviderId) opt.selected = true;
                 g.appendChild(opt);
             }
             sel.appendChild(g);
+        }
+
+        // 上面按 provider+model 精确匹配没命中(比如首次启动、或 provider 变了)，
+        // 退回只按模型名选第一个 —— 总比一个都不选好
+        if (sel.selectedIndex < 0 && current) {
+            for (const o of sel.options)
+                if (o.dataset.model === current) { o.selected = true; break; }
         }
     } else if (items) {
         for (const it of items) {
@@ -2022,16 +2047,14 @@ function onStatus(text) {
     document.getElementById("status-text").textContent = text || "";
 }
 
-// 执行器模式:本窗口不是主控(脑),只被动接受主控经命名管道发来的工具调用。
-// 禁用对话输入,避免两个窗口各写各的对话数据。
-function onExecutorMode(hint) {
-    state.executorMode = true;
+// 预填输入框并聚焦(配方 promote 用:塞一句固化指令,用户确认后回车即发送)
+function onUserTextPrefill(text) {
     const box = document.getElementById("input-box");
-    if (box) box.disabled = true;
-    document.getElementById("send-btn").style.display = "none";
-    const hintEl = document.getElementById("executor-hint");
-    if (hintEl) { hintEl.textContent = hint || "本窗口为执行器模式。"; hintEl.style.display = "flex"; }
-    onStatus(hint || "执行器模式");
+    if (box) {
+        box.value = text || "";
+        box.focus();
+        box.dispatchEvent(new Event("input"));
+    }
 }
 
 function onBusy(value) {
@@ -3466,5 +3489,34 @@ try {
 }
 
 </script>
+
+<!-- 配方侧边栏:宿主回复(recipe.*)经 PostWebMessageAsJson 走页面 message 事件,
+     在这里统一接住后分流转交;其余消息仍走 dispatchMessage,不受影响。 -->
+<script>
+if (window.chrome && window.chrome.webview) {
+    window.chrome.webview.addEventListener("message", function (e) {
+        try {
+            var msg = (typeof e.data === "string") ? JSON.parse(e.data) : e.data;
+            if (msg && msg.type && msg.type.indexOf("recipe.") === 0) {
+                if (window.txRecipes) { window.txRecipes.onHostMessage(msg); }
+                return;
+            }
+        } catch (err) { console.error("recipe message parse:", err); }
+    });
+}
+</script>
+<script src="recipe-sidebar.js"></script>
+<script>
+try {
+    if (window.txRecipes && document.getElementById("shell")) {
+        window.txRecipes.mount(document.getElementById("shell"));
+    } else {
+        console.error("txRecipes 或 #shell 不存在,配方侧边栏未挂载");
+    }
+} catch (e) { console.error("recipe sidebar mount:", e); }
+</script>
+
+</div><!-- /#app -->
+</div><!-- /#shell -->
 </body>
 </html>

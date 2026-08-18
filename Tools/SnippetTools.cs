@@ -27,8 +27,10 @@ namespace TxTools.Agent.Tools
                        "当你通过探查 API + run_csharp 跑通了一个有价值的做法,应当用它存下来:" +
                        "name 简短可检索,description 说明用途/前提,code 为可直接交给 run_csharp 执行的方法体。" +
                        "tags 为语义标签数组(如 [\"robot\",\"label\",\"weld\"]),自动从代码提取但也可手动指定。" +
-                       "注意:run_csharp 执行成功后系统会自动存片段(带 auto_ 前缀)," +
-                       "你只需对需要手动覆盖或补充说明的片段调用此工具。";
+                       "注意:run_csharp 执行成功【不会】立刻存成片段 —— " +
+                       "同类操作重复出现 3 次后系统才自动固化(带 auto_ 前缀)。" +
+                       "所以碰到确实值得复用、又不想等它重复三次的做法，就用本工具主动存下来。" +
+                       "lang 务必填对(csharp / python)：取出时模型要靠它决定送给哪个执行工具。";
             }
         }
 
@@ -44,7 +46,8 @@ namespace TxTools.Agent.Tools
                         ""name"": { ""type"": ""string"", ""description"": ""片段名(唯一, 简短可检索)"" },
                         ""description"": { ""type"": ""string"", ""description"": ""用途/前提/注意事项"" },
                         ""code"": { ""type"": ""string"", ""description"": ""可直接交给 run_csharp 的 C# 5 方法体"" },
-                        ""tags"": { ""type"": ""array"", ""items"": { ""type"": ""string"" }, ""description"": ""语义标签数组(如 [\""robot\"",\""label\"",\""weld\""]), 可留空自动提取"" }
+                        ""tags"": { ""type"": ""array"", ""items"": { ""type"": ""string"" }, ""description"": ""语义标签数组(如 [\""robot\"",\""label\"",\""weld\""]), 可留空自动提取"" },
+                        ""lang"": { ""type"": ""string"", ""enum"": [""csharp"", ""python""], ""description"": ""代码语言。存 run_csharp 的代码填 csharp, 存 run_python/probe_python 的代码填 python。留空按 csharp 处理"" }
                     },
                     ""required"": [""name"", ""code""]
                 }");
@@ -70,6 +73,7 @@ namespace TxTools.Agent.Tools
                 Name = name.Trim(),
                 Description = GetString(input, "description", ""),
                 Code = code,
+                Lang = SnippetStore.NormalizeLang(GetString(input, "lang", "csharp")),
                 Tags = tagList,
                 Origin = "manual"
             });
@@ -175,8 +179,9 @@ namespace TxTools.Agent.Tools
             foreach (var s in list)
             {
                 var tagStr = s.Tags != null && s.Tags.Count > 0 ? "[" + string.Join(",", s.Tags) + "]" : "";
-                var usageStr = s.SuccessCount > 0 ? "(复用" + s.SuccessCount + "次)" : "";
-                sb.AppendLine("• " + s.Name + " " + tagStr + " — "
+                var usageStr = s.SuccessCount + s.FailureCount > 0
+                    ? "(" + s.SuccessCount + "成/" + s.FailureCount + "败)" : "";
+                sb.AppendLine("• " + s.Name + " <" + SnippetStore.NormalizeLang(s.Lang) + "> " + tagStr + " — "
                     + (string.IsNullOrEmpty(s.Description) ? "(无说明)" : s.Description) + " " + usageStr);
             }
             return sb.ToString();
@@ -190,7 +195,15 @@ namespace TxTools.Agent.Tools
 
         public override string Description
         {
-            get { return "按 name 取出某片段的完整代码(可直接或稍改后交给 run_csharp 执行)。取出后系统会自动增加该片段的复用计数。"; }
+            get
+            {
+                return "按 name 取出某片段的完整代码。" +
+                       "【注意片段有 C# 和 Python 两种】返回结果里的「语言」一行决定它该送给哪个工具，" +
+                       "不要看着代码眼熟就往 run_csharp 里塞。" +
+                       "取出后系统会在你随后执行代码时自动判定这次复用成没成，回填到该片段的成功率。" +
+                       "所以:取出来发现不合用就别执行，直接换一条或自己写 —— " +
+                       "不会因此给它记失败；改动越小，判定越准。";
+            }
         }
 
         public override bool IsReadOnly { get { return true; } }
@@ -215,15 +228,22 @@ namespace TxTools.Agent.Tools
             var snip = SnippetStore.Get(name);
             if (snip == null) return "未找到片段: " + name;
 
-            // 增加复用计数(越用越聪明)
-            SnippetStore.IncrementUsage(name);
+            // 【不再在这里记成功】取出只登记"待判定",
+            // 等随后真正执行代码时由 SnippetUsageLedger 回填成功/失败。
+            SnippetUsageLedger.Register(snip.Name, snip.Code, snip.Lang);
+
+            var lang = SnippetStore.NormalizeLang(snip.Lang);
 
             var sb = new StringBuilder();
             sb.AppendLine("片段: " + snip.Name);
+            sb.AppendLine("语言: " + lang
+                + (lang == "python" ? "  → 交给 run_python / probe_python 执行"
+                                    : "  → 交给 run_csharp 执行"));
             if (!string.IsNullOrEmpty(snip.Description)) sb.AppendLine("说明: " + snip.Description);
             if (snip.Tags != null && snip.Tags.Count > 0)
                 sb.AppendLine("标签: " + string.Join(",", snip.Tags));
-            sb.AppendLine("复用: " + snip.SuccessCount + "次");
+            sb.AppendLine("复用记录: " + snip.SuccessCount + " 成 / " + snip.FailureCount + " 败"
+                + (snip.UndecidedCount > 0 ? " / " + snip.UndecidedCount + " 未判定" : ""));
             sb.AppendLine("--- 代码 ---");
             sb.Append(snip.Code);
             return sb.ToString();
@@ -275,8 +295,9 @@ namespace TxTools.Agent.Tools
             foreach (var s in list)
             {
                 var tagStr = s.Tags != null && s.Tags.Count > 0 ? "[" + string.Join(",", s.Tags) + "]" : "";
-                var usageStr = s.SuccessCount > 0 ? "(复用" + s.SuccessCount + "次)" : "";
-                sb.AppendLine("• " + s.Name + " " + tagStr + " — "
+                var usageStr = s.SuccessCount + s.FailureCount > 0
+                    ? "(" + s.SuccessCount + "成/" + s.FailureCount + "败)" : "";
+                sb.AppendLine("• " + s.Name + " <" + SnippetStore.NormalizeLang(s.Lang) + "> " + tagStr + " — "
                     + (string.IsNullOrEmpty(s.Description) ? "(无说明)" : s.Description) + " " + usageStr);
             }
             sb.AppendLine("用 get_snippet 按名称取出完整代码。");

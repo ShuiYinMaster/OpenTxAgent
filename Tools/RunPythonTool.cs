@@ -25,6 +25,8 @@ namespace TxTools.Agent.Tools
 
     public abstract class PythonToolBase : TxAgentToolBase
     {
+        /// <summary>取当前对话 id，供片段固化/归因记录 convId。【统一走 AgentContext.ConvIdProvider】</summary>
+
         protected abstract PythonRunMode Mode { get; }
 
         public override JObject InputSchema
@@ -75,6 +77,18 @@ namespace TxTools.Agent.Tools
             catch (Exception ex)
             {
                 return "Python 执行通道异常：" + ex.GetType().Name + ": " + ex.Message;
+            }
+
+            // ── 片段挂钩（与 run_csharp 同一套闭环, lang="python"）──
+            // 归因:get_snippet 取出的 python 片段这次用没用成(成败都报)
+            SnippetUsageLedger.NoteExecutionAsync(code, result.Success, "python");
+
+            // 固化观察:只看成功的代码,重复出现够次数自动进正式片段
+            if (result.Success && Mode == PythonRunMode.Execute)
+            {
+                string convId = null;
+                try { convId = AgentContext.CurrentConvId(); } catch { }
+                PendingSnippetStore.ObserveAsync(code, convId, "python");
             }
 
             return result.ToAgentText();
@@ -226,6 +240,13 @@ namespace TxTools.Agent.Tools
                      "保存/关闭文档（不可撤销）"),
             new Rule(@"\bEnvironment\s*\.\s*Exit\b",
                      "进程退出"),
+            // 动态执行:能绕开下面所有基于名字的规则。
+            // __import__('os').system('...') 既躲过 \bos\s*\. 也躲过 PascalCase 变更规则,
+            // 且变更检查是在剥掉字符串字面量之后跑的 —— exec 里的代码根本不会被看到。
+            new Rule(@"\b(exec|eval|compile|__import__)\s*\(",
+                     "动态执行 (exec/eval/compile/__import__) —— 静态检查无法看穿"),
+            new Rule(@"\bgetattr\s*\([^)]*,\s*['\""](?:Set|Create|Delete|Remove|Add|Insert|Save|Apply|Import|Export)",
+                     "用 getattr 动态取变更类方法"),
         };
 
         /// <summary>
@@ -253,8 +274,21 @@ namespace TxTools.Agent.Tools
         {
             if (string.IsNullOrEmpty(code)) return null;
 
-            var side = Collect(code, SideEffectRules);
-            var mut = Collect(code, MutationRules);
+            // 【必须先剥掉注释和字符串】原来直接在原始代码上跑正则，于是
+            //     # obj.Prop = 5              (注释)
+            //     print("设置 obj.Name = 新值")  (字符串)
+            // 都会命中"对象成员赋值"而被拒。模型收到的拒绝信息说的是
+            // "检测到场景写操作"，它不会怀疑到自己的注释头上，只会反复改代码。
+            //
+            // 两份扫描结果分开用:
+            //   noComments —— 去注释、字符串原样。副作用规则要看字符串内容
+            //                 (open(path,'w') 的模式字符就在字符串里)。
+            //   noStrings  —— 去注释、字符串内容清空。变更规则只认代码结构。
+            string noComments, noStrings;
+            Scan(code, out noComments, out noStrings);
+
+            var side = Collect(noComments, SideEffectRules);
+            var mut = Collect(noStrings, MutationRules);
             if (side.Count == 0 && mut.Count == 0) return null;
 
             var sb = new StringBuilder();
@@ -262,6 +296,15 @@ namespace TxTools.Agent.Tools
             {
                 sb.AppendLine("检测到场景写操作（probe 是只读探测，不允许修改场景）：");
                 foreach (var h in mut) sb.AppendLine(h);
+                sb.AppendLine();
+                sb.AppendLine("【已知限制，先看这里再改代码】静态检查分不清"
+                    + "「改场景对象」和「改本地 .NET 数据对象」，以下写法虽然是纯内存操作，也会被一并拦下：");
+                sb.AppendLine("  - filter.AddEntry(...)      构造 TxTypeFilter");
+                sb.AppendLine("  - lst.Add(obj)              往 TxObjectList 里装对象");
+                sb.AppendLine("  - data.SomeProp = ...       给 TxXxxCreationData 赋值");
+                sb.AppendLine("这不是你写错了，改多少遍都还是会被拦。"
+                    + "需要这类构造时直接改用 run_csharp（它走审批，但能做完整遍历），"
+                    + "或者先看看有没有现成的原生工具能直接给出结果。");
             }
             if (side.Count > 0)
             {
@@ -270,6 +313,66 @@ namespace TxTools.Agent.Tools
                 foreach (var h in side) sb.AppendLine(h);
             }
             return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// 一次遍历产出两份代码:去注释版、去注释且字符串置空版。
+        /// 处理 Python 的三引号、单双引号与反斜杠转义。
+        /// 不求做成完整词法分析 —— 只要不再把注释和字符串里的内容当代码看即可。
+        /// </summary>
+        private static void Scan(string code, out string noComments, out string noStrings)
+        {
+            var a = new StringBuilder(code.Length);
+            var b = new StringBuilder(code.Length);
+
+            int i = 0, n = code.Length;
+            while (i < n)
+            {
+                char c = code[i];
+
+                // 注释:两份都丢弃
+                if (c == '#')
+                {
+                    while (i < n && code[i] != '\n') i++;
+                    continue;
+                }
+
+                if (c == '"' || c == '\'')
+                {
+                    bool triple = (i + 2 < n && code[i + 1] == c && code[i + 2] == c);
+                    int quoteLen = triple ? 3 : 1;
+                    int start = i;
+                    i += quoteLen;
+
+                    while (i < n)
+                    {
+                        if (code[i] == '\\') { i += 2; continue; }
+                        if (triple)
+                        {
+                            if (i + 2 < n && code[i] == c && code[i + 1] == c && code[i + 2] == c)
+                            { i += 3; break; }
+                        }
+                        else
+                        {
+                            if (code[i] == c) { i++; break; }
+                            if (code[i] == '\n') break;   // 未闭合的单行字符串,就此打住
+                        }
+                        i++;
+                    }
+                    if (i > n) i = n;
+
+                    a.Append(code, start, i - start);                 // 原样保留
+                    b.Append(c, quoteLen).Append(c, quoteLen);        // 置空占位
+                    continue;
+                }
+
+                a.Append(c);
+                b.Append(c);
+                i++;
+            }
+
+            noComments = a.ToString();
+            noStrings = b.ToString();
         }
 
         private static List<string> Collect(string code, Rule[] rules)

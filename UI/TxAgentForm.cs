@@ -42,11 +42,6 @@ namespace TxTools.Agent.UI
         private DeepSeekClient _client;
         private IAgentLoop _loop;
 
-        // ── 多 PDPS:角色仲裁 + RPC 执行器 ──
-        // 无界面执行器由 TxAgentService 统一管理(插件加载即启动,与窗体无关)。
-        // 窗体只读角色:主控显示对话界面,执行器模式显示只读提示。
-        private bool _isBrain = true;
-
         /// <summary>
         /// 是否启用新 harness(TxAgent.Core)引擎。默认 false,保持原有 AgentLoop 行为不变。
         /// 改为 true 即切换到 HarnessAgentLoop(用新 harness 的 AgentLoop 驱动现有 26 个工具)。
@@ -136,8 +131,8 @@ namespace TxTools.Agent.UI
                 AutoSize = false,
                 Dock = DockStyle.Fill,
                 TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
-                Font = new System.Drawing.Font("Microsoft YaHei UI", 11f),
-                ForeColor = System.Drawing.Color.FromArgb(120, 120, 120),
+                Font = TxTools.Common.FormUiKit.TitleFont,
+                ForeColor = TxTools.Common.FormUiKit.Theme.TextFaint,
                 BackColor = System.Drawing.Color.Transparent
             };
             _loadingOverlay.Controls.Add(_loadingLabel);
@@ -157,22 +152,9 @@ namespace TxTools.Agent.UI
         {
             base.OnInitTxForm();
             try { SemiModal = false; } catch { }
-        }
-
-        // ── 多 PDPS:角色仲裁 + RPC 执行器 ──
-        // 无界面执行器由 TxAgentService 统一管理(插件加载即启动,不依赖本窗体)。
-        // 这里只是幂等地刷一次心跳,并读取本进程角色,决定显示对话还是执行器提示。
-        private void InitMultiPds()
-        {
-            try
-            {
-                TxAgentService.Start(_tools);       // 幂等:已启动则只刷心跳
-                _isBrain = TxAgentService.IsBrain;
-            }
-            catch (Exception ex)
-            {
-                try { AuditLog.Write("[warn] [MultiPds] 初始化失败: " + ex.Message); } catch { }
-            }
+            // 窗体必在 PS 主线程创建，此刻消息循环在跑 —— 最可靠的主线程上下文来源。
+            // 刷新 PsContext 缓存，保证 RPC 后台线程也能封送回主线程（被控端免窗体场景尤其关键）。
+            try { TxTools.Agent.Core.PsContext.CaptureFromMainThread(); } catch { }
         }
 
         protected override void OnLoad(EventArgs e)
@@ -180,23 +162,23 @@ namespace TxTools.Agent.UI
             base.OnLoad(e);
             FormUiKit.ApplyDpiScaling(this, ref _dpiApplied, DesignSize);
             _loadingTimer.Start();
-            InitMultiPds();
             InitWebViewAsync();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            // 注:TxAgentService(执行器)生命周期 = 进程,关窗不停止 ——
-            // 本进程可能正作为被控端被主控调用,残留项由心跳 TTL(45s)自动清理。
-            CleanupWebViewProfile();             // 清掉本进程的 WebView2 缓存目录
-
             // 若正等审批,视为拒绝解除阻塞,让后台线程能退出
             ReleasePendingApproval(false);
             FireExtractLessons();                // 关窗前对当前对话跑一次经验萃取
             try { UploadStore.ClearAll(); } catch { }
+            CleanupWebViewProfile();
             AgentLoop.Current = null;
             base.OnFormClosed(e);
         }
+
+        // ─────────────────────────────────────────────────────
+        //  WebView2 初始化 + HTML 加载
+        // ─────────────────────────────────────────────────────
 
         /// <summary>
         /// 建一个进程独占的 WebView2 环境。目录带 PID，多个 PDPS 互不干扰。
@@ -241,10 +223,6 @@ namespace TxTools.Agent.UI
             catch { }
         }
 
-        // ─────────────────────────────────────────────────────
-        //  WebView2 初始化 + HTML 加载
-        // ─────────────────────────────────────────────────────
-
         private async void InitWebViewAsync()
         {
             try
@@ -254,7 +232,8 @@ namespace TxTools.Agent.UI
                 // 于是抢同一个目录 —— 而 WebView2 对它是【独占锁】,
                 // 第二个进程会一直卡在 EnsureCoreWebView2Async 不返回,
                 // 界面就停在"正在加载 TxAgent UI …"。
-                await _webView.EnsureCoreWebView2Async(CreateWebViewEnvironmentAsync().Result);
+                var env = await CreateWebViewEnvironmentAsync();
+                await _webView.EnsureCoreWebView2Async(env);
                 try { _webView.CoreWebView2.Settings.AreDevToolsEnabled = true; } catch { }
                 try { _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true; } catch { }
                 try { _webView.CoreWebView2.Settings.IsWebMessageEnabled = true; } catch { }
@@ -304,6 +283,28 @@ namespace TxTools.Agent.UI
                             ev.Response = _webView.CoreWebView2.Environment.CreateWebResourceResponse(
                                 stream, 200, "OK", "Content-Type: text/html; charset=utf-8");
                         }
+                        else if (uri.EndsWith("/recipe-sidebar.css", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var css = ReadEmbeddedWebResource("recipe-sidebar.css");
+                            if (css != null)
+                                ev.Response = _webView.CoreWebView2.Environment.CreateWebResourceResponse(
+                                    new MemoryStream(System.Text.Encoding.UTF8.GetBytes(css)),
+                                    200, "OK", "Content-Type: text/css; charset=utf-8");
+                            else
+                                ev.Response = _webView.CoreWebView2.Environment.CreateWebResourceResponse(
+                                    null, 404, "Not Found", "");
+                        }
+                        else if (uri.EndsWith("/recipe-sidebar.js", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var js = ReadEmbeddedWebResource("recipe-sidebar.js");
+                            if (js != null)
+                                ev.Response = _webView.CoreWebView2.Environment.CreateWebResourceResponse(
+                                    new MemoryStream(System.Text.Encoding.UTF8.GetBytes(js)),
+                                    200, "OK", "Content-Type: application/javascript; charset=utf-8");
+                            else
+                                ev.Response = _webView.CoreWebView2.Environment.CreateWebResourceResponse(
+                                    null, 404, "Not Found", "");
+                        }
                         else
                         {
                             // favicon.ico 等资源 —— 直接 204,消掉 Console 里的 404 噪音
@@ -334,9 +335,15 @@ namespace TxTools.Agent.UI
         /// </summary>
         private static string ReadEmbeddedChatHtml()
         {
+            return ReadEmbeddedWebResource("chat.html");
+        }
+
+        /// <summary>按文件名尾部匹配读嵌入资源。sidecar 资源(recipe-sidebar.css/js)共用。</summary>
+        private static string ReadEmbeddedWebResource(string fileName)
+        {
             var asm = typeof(TxAgentForm).Assembly;
             string resName = asm.GetManifestResourceNames()
-                .FirstOrDefault(n => n.EndsWith("chat.html", StringComparison.OrdinalIgnoreCase));
+                .FirstOrDefault(n => n.EndsWith(fileName, StringComparison.OrdinalIgnoreCase));
             if (string.IsNullOrEmpty(resName)) return null;
 
             using (var s = asm.GetManifestResourceStream(resName))
@@ -394,6 +401,18 @@ namespace TxTools.Agent.UI
             }
 
             var type = (string)msg["type"];
+
+            // 配方侧边栏消息分流:recipe.* 全部交给侧边栏处理器,不进对话逻辑
+            if (type != null && type.StartsWith("recipe.", StringComparison.Ordinal))
+            {
+                try { OnRecipeWebMessage(msg); }
+                catch (Exception ex)
+                {
+                    try { AuditLog.Write("[warn] [Recipe] 处理侧边栏消息失败: " + ex.Message); } catch { }
+                }
+                return;
+            }
+
             try
             {
                 switch (type)
@@ -416,7 +435,10 @@ namespace TxTools.Agent.UI
                         }
 
                     case "switchModel":
-                        SwitchModel((string)msg["model"]);
+                        // providerId 由前端的 option.dataset 带过来。
+                        // 【不能只靠模型名反查】百炼代理了 deepseek/kimi，
+                        // 同名模型在两个 provider 下都存在，按名反查必然串。
+                        SwitchModel((string)msg["model"], (string)msg["providerId"]);
                         break;
 
                     case "setApprovalMode":
@@ -517,21 +539,274 @@ namespace TxTools.Agent.UI
             }
         }
 
+        // ═══════════════════════════════════════════════════════════
+        //  配方侧边栏(recipe.* 消息)
+        // ═══════════════════════════════════════════════════════════
+        //  与 chat.html 里的 window.txRecipes 配对。绑定值(ITxObject.Id)只活在
+        //  侧边栏内存 + study 键校验,不落盘 —— 见 RecipeStore.cs 顶部说明。
+
+        private void OnRecipeWebMessage(JObject msg)
+        {
+            var type = (string)msg["type"] ?? "";
+            var seq = (int?)msg["seq"] ?? 0;
+
+            switch (type)
+            {
+                case "recipe.list":          HandleRecipeList(seq); break;
+                case "recipe.pickSelection": HandlePickSelection(seq, msg); break;
+                case "recipe.run":           HandleRecipeRun(seq, msg); break;
+                case "recipe.reveal":        HandleRecipeReveal(seq, msg); break;
+                case "recipe.promote":       HandleRecipePromote(seq, msg); break;
+            }
+        }
+
+        private void ReplyToWeb(int seq, JObject payload)
+        {
+            payload["seq"] = seq;
+            // 【必须回到 UI 线程】PostWebMessageAsJson 只能在创建 WebView2 的线程上调,
+            // 而下面几个 Handler 里有跑在后台线程的分支。
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)(() => ReplyToWeb(seq, payload)));
+                return;
+            }
+            _webView.CoreWebView2.PostWebMessageAsJson(JsonConvert.SerializeObject(payload));
+        }
+
+        private void HandleRecipeList(int seq)
+        {
+            var recipes = new JArray();
+            foreach (var r in RecipeStore.All())
+            {
+                var jr = new JObject
+                {
+                    ["id"] = r.Id, ["name"] = r.Name, ["description"] = r.Description,
+                    ["lang"] = r.Lang, ["runCount"] = r.RunCount, ["failCount"] = r.FailCount
+                };
+                var jp = new JArray();
+                foreach (var p in r.Params)
+                    jp.Add(new JObject
+                    {
+                        ["name"] = p.Name, ["label"] = p.Label, ["kind"] = p.Kind,
+                        ["typeHint"] = p.TypeHint, ["required"] = p.Required,
+                        ["def"] = p.Default, ["help"] = p.Help
+                    });
+                jr["params"] = jp;
+                recipes.Add(jr);
+            }
+
+            var cands = new JArray();
+            foreach (var s in RecipeStore.PromotionCandidates())
+                cands.Add(new JObject { ["name"] = s.Name, ["successCount"] = s.SuccessCount });
+
+            ReplyToWeb(seq, new JObject
+            {
+                ["type"] = "recipe.list.result", ["ok"] = true,
+                ["recipes"] = recipes, ["candidates"] = cands,
+                ["study"] = CurrentStudyKey()
+            });
+        }
+
+        /// <summary>
+        /// 绑定值只在同一个 study 内有效,所以要一个能区分 study 的键。
+        /// 用 study 名 —— 换了 study 前端就把绑定全部作废并要求重选。
+        /// 【不要在换 study 后按名字重新解析对象】同一 study 内都可能有多台同名机器人,
+        /// 跨 study 猜就是纯赌,而赌错了不会报错,只会对着错误的对象执行。
+        /// </summary>
+        private string CurrentStudyKey()
+        {
+            try
+            {
+                dynamic doc = TxApplication.ActiveDocument;
+                if (doc == null) return null;
+                dynamic study = doc.CurrentStudy;
+                return study == null ? null : (string)study.Name;
+            }
+            catch { return null; }
+        }
+
+        private void HandlePickSelection(int seq, JObject msg)
+        {
+            bool multi = msg["multi"] != null && (bool)msg["multi"];
+            try
+            {
+                var sel = TxApplication.ActiveSelection.GetItems();
+                if (sel == null || sel.Count == 0)
+                {
+                    ReplyToWeb(seq, new JObject { ["ok"] = false,
+                        ["error"] = "PS 里当前没有选中任何对象。" });
+                    return;
+                }
+
+                if (!multi && sel.Count > 1)
+                {
+                    // 【不要替它选第一个】这正是踩过四次的那个模式。
+                    ReplyToWeb(seq, new JObject { ["ok"] = false,
+                        ["error"] = "当前选中了 " + sel.Count + " 个对象，而这个参数只要一个。请只选一个再点。" });
+                    return;
+                }
+
+                if (multi)
+                {
+                    // ITxObject.Id 里本身含逗号("3,57,2,1"),所以多选用 | 分隔
+                    var ids = string.Join("|", sel.Select(o => o.Id));
+                    ReplyToWeb(seq, new JObject { ["ok"] = true, ["id"] = ids,
+                        ["name"] = sel[0].Name, ["count"] = sel.Count,
+                        ["type"] = sel[0].GetType().Name });
+                }
+                else
+                {
+                    var o = sel[0];
+                    ReplyToWeb(seq, new JObject { ["ok"] = true, ["id"] = o.Id,
+                        ["name"] = o.Name, ["count"] = 1, ["type"] = o.GetType().Name });
+                }
+            }
+            catch (Exception ex)
+            {
+                ReplyToWeb(seq, new JObject { ["ok"] = false, ["error"] = "取选择失败: " + ex.Message });
+            }
+        }
+
+        private void HandleRecipeRun(int seq, JObject msg)
+        {
+            var id = (string)msg["recipeId"];
+            var r = RecipeStore.Get(id);
+            if (r == null)
+            {
+                ReplyToWeb(seq, new JObject { ["ok"] = false, ["error"] = "配方不存在，可能已被删除。" });
+                return;
+            }
+
+            var args = new Dictionary<string, string>();
+            var jargs = msg["args"] as JObject;
+            if (jargs != null)
+                foreach (var kv in jargs) args[kv.Key] = kv.Value == null ? null : kv.Value.ToString();
+
+            string err;
+            var full = RecipeRunner.BuildCode(r, args, out err);
+            if (full == null)
+            {
+                ReplyToWeb(seq, new JObject { ["ok"] = false, ["error"] = err });
+                return;
+            }
+
+            // ── 不走审批 ──
+            // 配方代码是人工固化过的,审批框里那段代码没有新信息量;
+            // 参数才是这次的变量,而参数就摆在侧边栏上,比审批框好读。
+            // 兜底靠 undo:下面把配方名传给 undoLabel,用户在 Ctrl+Z 历史里能认出是哪一步。
+
+            // ── 后台线程执行,不要阻塞 UI ──
+            // 原来整个 HandleRecipeRun 在 WebMessageReceived(UI 线程)里同步跑:
+            // 编译在 UI 线程、执行也占着 PS 主线程,前端连"执行中"都渲染不出来。
+            // 这里丢到后台线程:编译(C#)在后台做,执行仍由 RunCSharp/PythonHost 内部
+            // 封送回 PS 主线程(与 AgentLoop 调工具是同一套 PsContext 路由),UI 保持响应,
+            // 前端能显示执行中的反馈,完成后 ReplyToWeb 跨线程回 UI 发消息。
+            var lang = SnippetStore.NormalizeLang(r.Lang);
+            var runId = r.Id;
+            var runName = r.Name;
+
+            Task.Run(delegate
+            {
+                bool ok;
+                string text;
+                try
+                {
+                    if (lang == "python")
+                    {
+                        // PythonHost 未配置 MainThreadContext 时 Run 会在调用线程直接跑,
+                        // 而脚本里的 PS API 必须走主线程 —— 与 RunPythonTool 同样用
+                        // PsContext 包住整个 Run,避免从后台线程碰 PS API。
+                        var res = default(TxTools.Agent.Scripting.PythonExecResult);
+                        PsContext.Current.Run(delegate
+                        {
+                            res = TxTools.Agent.Scripting.PythonHostProvider.Instance.Run(
+                                full, TxTools.Agent.Scripting.PythonRunMode.Execute, "配方: " + runName);
+                        });
+                        ok = res != null && res.Success;
+                        text = res != null ? res.ToAgentText() : "(无结果)";
+                    }
+                    else
+                    {
+                        text = TxTools.Agent.Ps.PsBridge.RunCSharp(full, out ok, "配方: " + runName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ok = false;
+                    text = "执行异常: " + ex.Message;
+                }
+
+                RecipeStore.RecordRun(runId, ok);
+                try
+                {
+                    AuditLog.Write((ok ? "[info]" : "[warn]") + " [Recipe] " + runName
+                        + " 执行" + (ok ? "成功" : "失败") + "，参数: "
+                        + string.Join(", ", args.Select(kv => kv.Key + "=" + kv.Value)));
+                }
+                catch { }
+
+                ReplyToWeb(seq, new JObject { ["ok"] = ok, ["text"] = text ?? "" });
+            });
+        }
+
+        /// <summary>recipe.reveal:把配方原文当作一条助手消息推进聊天区,不必走模型。</summary>
+        private void HandleRecipeReveal(int seq, JObject msg)
+        {
+            var id = (string)msg["recipeId"];
+            var r = RecipeStore.Get(id);
+            if (r == null)
+            {
+                ReplyToWeb(seq, new JObject { ["ok"] = false, ["error"] = "配方不存在。" });
+                return;
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("**【配方 ").Append(r.Name).Append("】** ");
+            if (!string.IsNullOrWhiteSpace(r.Description)) sb.AppendLine(r.Description.Trim());
+            sb.AppendLine();
+            sb.AppendLine("语言: ").Append(SnippetStore.NormalizeLang(r.Lang));
+            if (r.Params != null && r.Params.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("参数:");
+                foreach (var p in r.Params)
+                    sb.Append("- ").Append(p.Name)
+                      .Append(p.Label != null && !string.Equals(p.Label, p.Name, StringComparison.Ordinal)
+                          ? " (" + p.Label + ")" : "")
+                      .Append(" [").Append(p.Kind).AppendLine("]");
+            }
+            sb.AppendLine();
+            sb.AppendLine("```" + SnippetStore.NormalizeLang(r.Lang));
+            sb.AppendLine((r.Code ?? "").TrimEnd());
+            sb.AppendLine("```");
+
+            PostJs(new { type = "message", role = "assistant", text = sb.ToString() });
+            ReplyToWeb(seq, new JObject { ["ok"] = true });
+        }
+
+        /// <summary>
+        /// recipe.promote:把片段固化成配方。参数语义需要模型读代码后判断 ——
+        /// 往输入框塞一句预设提示并触发发送,走一轮正常对话。
+        /// </summary>
+        private void HandleRecipePromote(int seq, JObject msg)
+        {
+            var name = (string)msg["snippetName"];
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                ReplyToWeb(seq, new JObject { ["ok"] = false, ["error"] = "缺少 snippetName。" });
+                return;
+            }
+
+            var hint = "把片段 \"" + name + "\" 固化成配方：判断其中哪些部分应该做成参数（对象/数字/文本），"
+                     + "给每个参数起合法的英文变量名和中文标签，然后调用 save_recipe。";
+            PostJs(new { type = "userTextPrefill", text = hint });
+            ReplyToWeb(seq, new JObject { ["ok"] = true });
+        }
+
         /// <summary>JS 侧完成初始化后调用。发初始化数据、恢复上次对话或触发 API Key 输入。</summary>
         private void OnJsReady()
         {
             _webViewReady = true;
-
-            // 执行器模式:本窗口不是主控,禁用对话输入,提示用户去主控窗口操作
-            if (!_isBrain)
-            {
-                var brain = PsInstanceRegistry.Brain();
-                var hint = "本窗口为执行器模式,已接入主控(pid "
-                         + (brain != null ? brain.Pid.ToString() : "未知") + "),"
-                         + "对话请在主控窗口进行。";
-                PostJs(new { type = "executor", hint });
-                return;
-            }
 
             // 隐藏加载遮罩,让 WebView 显示出来
             try
@@ -837,7 +1112,9 @@ namespace TxTools.Agent.UI
             {
                 id = m.Id,
                 title = string.IsNullOrEmpty(m.Title) ? "(\u65e0\u6807\u9898)" : m.Title,
-                updated = m.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                updated = m.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                // 标出正被另一个 PDPS 进程打开的对话，避免用户点进去发现被拒
+                busy = m.HeldByOther
             }).ToList();
             PostJs(new { type = "convList", items });
         }
@@ -1110,11 +1387,25 @@ namespace TxTools.Agent.UI
         }
 
         /// <summary>切换模型。若模型属于不同 provider,自动重载对应 key 并重建 client。</summary>
-        private void SwitchModel(string model)
+        private void SwitchModel(string model, string providerId = null)
         {
             if (string.IsNullOrWhiteSpace(model)) return;
 
-            var targetProv = LlmProviders.FindByModel(model);
+            // 优先用前端明确指定的 provider;没给才退回按模型名猜(老协议兼容)。
+            // 按名猜是有歧义的 —— "deepseek-v4-flash" 在 deepseek 和 qwen 下都有。
+            LlmProvider targetProv = null;
+            if (!string.IsNullOrWhiteSpace(providerId))
+                targetProv = LlmProviders.ById(providerId);
+
+            if (targetProv == null)
+            {
+                targetProv = LlmProviders.FindByModel(model);
+                if (targetProv != null)
+                    AuditLog.Write("[warn] switchModel 未带 providerId，按模型名猜为 "
+                                 + targetProv.Id + "，跨 provider 同名模型可能选错。");
+            }
+
+            if (targetProv == null) { PostStatus("找不到该模型对应的 provider。"); return; }
             bool changedProvider = !string.Equals(targetProv.Id, _currentProviderId, StringComparison.Ordinal);
 
             _currentModel = model;
@@ -1135,6 +1426,9 @@ namespace TxTools.Agent.UI
                 }
                 _client = new DeepSeekClient(newKey ?? "ollama", targetProv.BaseUrl);
             }
+
+            // 让 ModelRouter 知道当前是哪家 —— 上下文窗口、视觉能力等都按 provider+model 双键查
+            ModelRouter.CurrentProviderId = _currentProviderId;
 
             if (_client == null) { PostStatus("\u5df2\u9884\u9009\u6a21\u578b: " + model); return; }
             _loop = BuildLoop(_client);
@@ -1168,8 +1462,54 @@ namespace TxTools.Agent.UI
         private void LoadMostRecentOrNew()
         {
             var metas = ConversationStore.List();
-            if (metas.Count > 0) LoadConversation(metas[0].Id);
+            // 【不能直接取最新的】另一个 PDPS 进程可能正开着它 ——
+            // 两边各自往 _fullHistory 追加，SaveCurrent 整份覆盖，后保存的把先保存的抹掉。
+            var pick = ConversationStore.PickAvailable();
+            if (pick != null) LoadConversation(pick.Id);
             else StartFreshConversation();
+        }
+
+        // ── 多进程协同 ──
+        // 同时开两个 PDPS 时，双方共享同一份磁盘数据。
+        //   watcher  对方新建/更新对话 → 刷新本地列表
+        //   heartbeat 定期续期占用锁，否则 3 分钟后对方会认为本会话已空闲
+        private ProcessSync.Watcher _convWatcher;
+        private System.Windows.Forms.Timer _lockHeartbeat;
+
+        private void StartProcessSync()
+        {
+            try
+            {
+                _convWatcher = ConversationStore.Watch(delegate
+                {
+                    // FileSystemWatcher 在后台线程回调，必须封送
+                    try
+                    {
+                        if (IsHandleCreated)
+                            BeginInvoke((System.Windows.Forms.MethodInvoker)delegate { PostConvList(); });
+                    }
+                    catch { }
+                });
+            }
+            catch { }
+
+            try
+            {
+                _lockHeartbeat = new System.Windows.Forms.Timer { Interval = 60000 };
+                _lockHeartbeat.Tick += delegate
+                {
+                    if (_current != null) ConversationStore.Acquire(_current.Id);
+                };
+                _lockHeartbeat.Start();
+            }
+            catch { }
+        }
+
+        private void StopProcessSync()
+        {
+            try { if (_convWatcher != null) _convWatcher.Dispose(); } catch { }
+            try { if (_lockHeartbeat != null) { _lockHeartbeat.Stop(); _lockHeartbeat.Dispose(); } } catch { }
+            try { if (_current != null) ConversationStore.Release(_current.Id); } catch { }
         }
 
         // 会话累计用量的基线:本次打开之前已经花掉的部分。
@@ -1178,7 +1518,10 @@ namespace TxTools.Agent.UI
 
         private void StartFreshConversation()
         {
+            if (_current != null) ConversationStore.Release(_current.Id);
+
             _current = new Conversation { Id = ConversationStore.NewId(), CreatedUtc = DateTime.UtcNow };
+            ConversationStore.Acquire(_current.Id);
             _baseP = 0; _baseC = 0;
             if (_loop != null)
             {
@@ -1194,6 +1537,21 @@ namespace TxTools.Agent.UI
         {
             var conv = ConversationStore.Load(id);
             if (conv == null) { StartFreshConversation(); return; }
+
+            if (!ConversationStore.Acquire(id))
+            {
+                PostStatus("该对话正被另一个 TxAgent 打开，已为你新建一个。");
+                StartFreshConversation();
+                return;
+            }
+
+            // 切走前释放上一个，别一个进程占着一堆
+            if (_current != null && !string.Equals(_current.Id, id, StringComparison.Ordinal))
+            {
+                try { SaveCurrent(); } catch { }
+                ConversationStore.Release(_current.Id);
+            }
+
             _current = conv;
             _baseP = conv.PromptTokens;
             _baseC = conv.CompletionTokens;
@@ -1225,6 +1583,7 @@ namespace TxTools.Agent.UI
         protected override void OnFormClosing(System.Windows.Forms.FormClosingEventArgs e)
         {
             // 先放行所有挂起的等待,否则阻塞在 tcs.Task.Result 上的后台线程会一直悬着
+            try { StopProcessSync(); } catch { }
             try { AskUserBridge.Handler = null; } catch { }
             try { ReleasePendingAskUser(null); } catch { }
             try { ReleasePendingApproval(false); } catch { }

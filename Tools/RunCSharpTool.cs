@@ -6,6 +6,11 @@
 //
 // v4：新增 Python 执行通道(probe_python / run_python)后，本工具的定位收窄为
 //     "性能热点 + 泛型/out 参数密集 + WinForms" 三类。探测类需求一律先走 probe_python。
+//
+// v5：片段闭环的两个挂钩接在这里 —— 本层同时握着源代码和执行结果，是天然挂载点；
+//     PsBridge 是通用 SDK 桥，不该知道片段库的存在。
+//       · SnippetUsageLedger.NoteExecutionAsync —— 回填 get_snippet 取出的片段这次用没用成
+//       · PendingSnippetStore.ObserveAsync      —— 同类操作重复够次数就固化成正式片段
 
 using Newtonsoft.Json.Linq;
 using TxTools.Agent.Core;
@@ -15,6 +20,11 @@ namespace TxTools.Agent.Tools
 {
     public sealed class RunCSharpTool : TxAgentToolBase
     {
+        /// <summary>
+        /// 会话 ID 的取法。固化片段时记进 conv_id 便于回溯，取不到也不影响功能。
+        /// 【统一走 AgentContext.ConvIdProvider】由宿主在注册工具时注入一次。
+        /// </summary>
+
         public override string Name { get { return "run_csharp"; } }
 
         public override string Description
@@ -65,7 +75,28 @@ namespace TxTools.Agent.Tools
 
         public override string Execute(JObject input)
         {
-            return PsBridge.RunCSharp(GetString(input, "code", ""));
+            var code = GetString(input, "code", "");
+
+            bool success;
+            var result = PsBridge.RunCSharp(code, out success);
+
+            // ── 挂钩一：复用归因 ──
+            // 【成功失败都要报】只在成功时报，等于只统计好消息，
+            // 片段成功率会单调趋近 100%，跟不统计没有区别。
+            // 内部是异步的，不占执行路径的时间。
+            SnippetUsageLedger.NoteExecutionAsync(code, success, "csharp");
+
+            // ── 挂钩二：片段固化观察 ──
+            // 只看成功的代码：跑不通的东西没有固化价值，
+            // 而且失败代码进了待定池会污染指纹计数，让错误写法攒够 3 次转正。
+            if (success)
+            {
+                string convId = null;
+                try { convId = AgentContext.CurrentConvId(); } catch { }
+                PendingSnippetStore.ObserveAsync(code, convId, "csharp");
+            }
+
+            return result;
         }
     }
 }
