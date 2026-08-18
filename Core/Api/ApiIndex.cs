@@ -303,6 +303,33 @@ namespace TxTools.Agent.Core
                 .ToList();
         }
 
+        /// <summary>
+        /// 跨类型搜【签名文本】,用于"谁接收/返回某个类型"。
+        ///
+        /// SearchMembers 只匹配成员名,回答不了"哪个方法吃 TxLibraryData"这类问题 ——
+        /// 而找一个数据类的消费者,往往正是摸清一条 API 链路的关键。
+        /// </summary>
+        public static List<string> SearchSignatures(string keyword, int max)
+        {
+            EnsureBuilt();
+            if (string.IsNullOrWhiteSpace(keyword)) return new List<string>();
+
+            var hits = new List<string>();
+            foreach (var t in ByFullName.Values)
+            {
+                foreach (var m in t.Members)
+                {
+                    if (m.DeclaredBy != t.Name) continue;      // 只报自有成员
+                    if (string.IsNullOrEmpty(m.Signature)) continue;
+                    if (m.Signature.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    hits.Add(t.Name + "." + m.Name + "  ->  " + m.Signature);
+                    if (hits.Count >= max) return hits;
+                }
+            }
+            return hits;
+        }
+
         /// <summary>跨类型搜成员名,用于"哪个类型上有 AddObject"。</summary>
         public static List<string> SearchMembers(string memberKeyword, int max)
         {

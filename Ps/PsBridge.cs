@@ -644,6 +644,30 @@ namespace TxTools.Agent.Ps
         /// <summary>编译(后台)+执行(主线程, 包 Undo)用户 C# 代码。调用方负责审批与审计。</summary>
         public static string RunCSharp(string code)
         {
+            bool ignored;
+            return RunCSharp(code, out ignored, null);
+        }
+
+        /// <summary>
+        /// 带成功标志的重载。
+        ///
+        /// 【为什么把 success 带出来，而不是让调用方解析返回文本】
+        /// "编译没过"和"执行抛异常"这两件事，在这个方法内部是确定已知的；
+        /// 一旦出了这个方法就只剩一段给人看的字符串，再判断就成了猜 ——
+        /// 而猜错的代价是把失败记成成功，静默地污染片段成功率。
+        ///
+        /// 注意 success=true 的含义仅限于"编译通过且没有抛出异常"。
+        /// 代码自己 return 出来的业务性失败（比如"未找到对象"）它看不出来，
+        /// 那需要调用方结合语义判断。
+        /// </summary>
+        /// <param name="undoLabel">
+        /// undo 块的名字，出现在用户的 Ctrl+Z 历史里。留空则用 "run_csharp"。
+        /// 【配方执行务必传】配方不走审批，undo 是唯一的兜底手段；
+        /// 全都叫 "run_csharp" 的话，连跑三个配方后用户根本认不出该撤到哪一步。
+        /// </param>
+        public static string RunCSharp(string code, out bool success, string undoLabel = null)
+        {
+            success = false;
             if (string.IsNullOrWhiteSpace(code)) return "未提供代码。";
 
             // 1) 编译：纯 CPU，不碰 PS —— 在调用线程(后台)进行，不冻结 UI。
@@ -651,18 +675,22 @@ namespace TxTools.Agent.Ps
             var assembly = CSharpRunner.Compile(code, out compileError);
             if (assembly == null) return compileError;
 
+            // out 参数不能被匿名方法捕获，用局部变量中转。
+            bool ok = false;
+
             // 2) 执行：碰 PS，必须主线程，包在 Undo 块里(可撤销)。
-            return PsContext.Current.Run<string>(delegate
+            var text = PsContext.Current.Run<string>(delegate
             {
                 var log = new StringBuilder();
                 Action<string> logfn = delegate (string s) { if (s != null) log.AppendLine(s); };
 
                 TxDocument doc = null;
                 try { doc = TxApplication.ActiveDocument; } catch { }
-                bool undo = doc != null && BeginUndo(doc, "run_csharp");
+                var label = string.IsNullOrWhiteSpace(undoLabel) ? "run_csharp" : undoLabel;
+                bool undo = doc != null && BeginUndo(doc, label);
 
                 string result;
-                try { result = CSharpRunner.Invoke(assembly, logfn); }
+                try { result = CSharpRunner.Invoke(assembly, logfn); ok = true; }
                 catch (Exception ex) { result = "执行异常: " + (ex.InnerException != null ? ex.InnerException.Message : ex.Message); }
                 finally { if (undo) EndUndo(doc); }
 
@@ -673,6 +701,10 @@ namespace TxTools.Agent.Ps
                 sb.Append("结果: ").Append(result);
                 return sb.ToString();
             });
+
+            // PsContext.Current.Run 是同步封送，回到这里时 ok 已经写好了。
+            success = ok;
+            return text;
         }
 
         // ───────── 新增：机器人基座校验 ─────────

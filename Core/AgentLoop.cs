@@ -210,6 +210,10 @@ namespace TxTools.Agent.Core
 【中间数据落盘】需要跨步骤携带的结构化数据（坐标表、映射关系、对象清单），
   一律写成文件再读，不要在对话里逐条罗列 —— 几十行以上的数据放在上下文里
   既占篇幅又容易抄错，而且极易让你在反复核对中陷入空转。
+【一次做完】需要多步才能完成的场景操作（遍历 + 计算 + 批量修改），
+  写成一个 run_csharp/run_python 脚本一次执行完，
+  不要拆成十几轮工具调用。中间数据留在脚本变量里，只把最终结果返回 ——
+  逐轮搬运数据既慢又容易抄错，还容易让你陷入空转。
 
 ━━━ probe_python / IronPython 纪律 ━━━
 probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下最常翻车:
@@ -272,6 +276,10 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
    每轮系统自动注入与当前问题最相关的片段(标记为『本轮相关代码片段』),先扫一眼,
    命中就直接引用/改写,不要从零摸索。主动搜:find_snippet(语义) / get_snippet(名称)。
    run_csharp 成功后系统自动存;需覆盖或补说明用 save_snippet。
+   【片段会自己长】同类操作重复几次后系统会自动固化成可复用片段，
+   你不需要主动 save_snippet —— 除非这段代码确实值得单独留存。
+   复用片段时若发现它有问题（API 已废弃、漏了判断、写法过时），
+   用 patch_snippet 就地修好并写明原因，不要绕开它另写一份。
    稳定多步流程用 save_recipe 固化成一键工具,动手前先 list_recipes 看有没有现成的。
 3) 事实记忆(Facts) —— 系统提示头部『已知事实』是跨对话保留的用户偏好/场景常量,视为默认前提。
    用户表达偏好或给出场景常量时主动 add_fact;全表 list_facts。
@@ -750,7 +758,17 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
             return first;
         }
 
-        // ── AutoSnippet: run_csharp 成功后自动存片段 ──
+        // ── AutoSnippet: run_csharp 成功后【投待定池】 ──
+        // 不再一次成功就存库 —— 绝大多数代码是一次性的,存下来只会稀释真正
+        // 有复用价值的那几条。改为重复出现够次数(PendingSnippetStore.PromoteThreshold)
+        // 才自动固化为正式片段;Observe 内部还会挡掉过短/骨架过浅/结构重复的代码。
+        //
+        // 【双链路现状】观察职责同时存在于两处:
+        //   · 本方法 —— 旧引擎(UseNewHarness=false)的 run_csharp 执行路径;
+        //   · RunCSharpTool/RunPythonTool —— harness 模式(UseNewHarness=true)的工具层挂钩,
+        //     能区分"编译失败 vs 返回值成功",harness 内核不硬编码工具名。
+        // 两处都投同一个待定池,按语言指纹聚合,不会重复计数(指纹一致只累加一次)。
+        // 若将来废弃旧引擎,可删本方法,harness 侧已覆盖。
 
         private void AutoSaveSnippet(JObject input, string output)
         {
@@ -763,23 +781,12 @@ probe_python 跑的是 PDPS 内嵌 IronPython 2.7,它是 Python 不是 C#,以下
                 || output.IndexOf("异常", StringComparison.OrdinalIgnoreCase) >= 0))
                 return;
             if (output != null && output.Trim().Length < 20) return;
-            if (SnippetStore.HasSimilarCode(code, 0.6)) return;
 
-            var tags = SnippetStore.ExtractTags(code);
-            var autoName = SnippetStore.AutoName(code);
-            var desc = SnippetStore.AutoDescription(code, tags);
-
-            var savedCode = code.Length > 2000 ? code.Substring(0, 2000) + "\n// …(截断)" : code;
-
-            SnippetStore.Upsert(new Snippet
+            var promoted = PendingSnippetStore.Observe(code, _currentConvId, "csharp");
+            if (promoted != null)
             {
-                Name = autoName,
-                Description = desc,
-                Code = savedCode,
-                Tags = tags,
-                Origin = "auto",
-                ConvId = _currentConvId
-            });
+                try { AuditLog.Write("[info] [Snippet] 已固化为可复用片段: " + promoted); } catch { }
+            }
         }
 
         private static string GetStringFromInput(JObject input, string key)

@@ -1244,21 +1244,26 @@ def tx_sig(o, name):
         }
 
         /// <summary>执行脚本。自动 marshal 到 PS 主线程。</summary>
-        public PythonExecResult Run(string code, PythonRunMode mode)
+        /// <param name="undoLabel">
+        /// 本次执行的 undo 分组名，出现在用户的 Ctrl+Z 历史里。留空则用 Options.UndoContextName。
+        /// 【配方执行务必传】配方不走审批，undo 是唯一的兜底手段；
+        /// 全都叫 "TxAgent Python Script" 的话，连跑几个配方后用户认不出该撤到哪一步。
+        /// </param>
+        public PythonExecResult Run(string code, PythonRunMode mode, string undoLabel = null)
         {
             var ctx = _opt.MainThreadContext;
             if (ctx != null && !ReferenceEquals(SynchronizationContext.Current, ctx))
             {
                 PythonExecResult result = null;
-                ctx.Send(_ => { result = RunGuarded(code, mode); }, null);
+                ctx.Send(_ => { result = RunGuarded(code, mode, undoLabel); }, null);
                 return result ?? Failed(mode, "MainThreadMarshalFailed", "主线程调度未返回结果。");
             }
-            return RunGuarded(code, mode);
+            return RunGuarded(code, mode, undoLabel);
         }
 
-        private PythonExecResult RunGuarded(string code, PythonRunMode mode)
+        private PythonExecResult RunGuarded(string code, PythonRunMode mode, string undoLabel)
         {
-            try { return RunCore(code, mode); }
+            try { return RunCore(code, mode, undoLabel); }
             catch (Exception ex) { return Failed(mode, ex.GetType().Name, ex.Message); }
         }
 
@@ -1267,7 +1272,7 @@ def tx_sig(o, name):
             return new PythonExecResult { Success = false, Mode = mode, ErrorType = type, ErrorMessage = msg };
         }
 
-        private PythonExecResult RunCore(string code, PythonRunMode mode)
+        private PythonExecResult RunCore(string code, PythonRunMode mode, string undoLabel)
         {
             var res = new PythonExecResult { Mode = mode };
             var sw = Stopwatch.StartNew();
@@ -1321,7 +1326,8 @@ def tx_sig(o, name):
                 }
 
                 // ---- 3. 事务内执行 ----
-                var undo = new UndoScope(_opt.UndoContextName, Log);
+                var undo = new UndoScope(
+                    string.IsNullOrWhiteSpace(undoLabel) ? _opt.UndoContextName : undoLabel, Log);
                 res.UndoAvailable = undo.Available;
                 res.CanRollback = undo.CanRollback;
                 bool ok = false;

@@ -46,6 +46,9 @@ namespace TxTools.Agent.Core
         /// <summary>是否为主控(脑)。全局应只有一个 true。</summary>
         public bool IsBrain { get; set; }
 
+        /// <summary>本实例是否已打开 Agent 窗口。全局应至多一个 true —— 避免两窗口各自写会话互相覆盖。</summary>
+        public bool HasWindow { get; set; }
+
         public DateTime HeartbeatUtc { get; set; }
 
         [JsonIgnore]
@@ -96,30 +99,129 @@ namespace TxTools.Agent.Core
         // ── 注册与心跳 ──
 
         /// <summary>
+        /// 跨进程互斥:保护"读全部 + 判定主控 + 写自己"这段 ——
+        /// 两个进程同时首次注册时有极小概率都判自己是主控(检查与写入非原子)。
+        /// 用 Local\ 会话级命名互斥体(PDPS 同机同会话);不用 Global\ 避免权限问题。
+        /// </summary>
+        private static readonly System.Threading.Mutex RegMutex =
+            new System.Threading.Mutex(false, @"Local\TxAgent_Registry_Mutex");
+
+        /// <summary>
         /// 注册本实例。返回本实例最终的角色 —— 已有活着的主控时自动退为执行器。
         /// 【每次心跳都要重新判定】主控进程崩掉后，剩下的执行器应该有人顶上。
         /// </summary>
         public static PsInstanceInfo Register(string study, bool wantBrain)
         {
-            var all = All();
-            var existingBrain = all.FirstOrDefault(x => x.IsBrain && x.IsAlive && !x.IsSelf);
+            PsInstanceInfo me = null;
+            bool gotLock = false;
+            try
+            {
+                // 心跳(30s 一次)也会走这里,5 秒拿不到锁说明另一个进程正卡在文件 I/O,
+                // 放弃本次重判即可 —— 下次心跳再来。
+                try { gotLock = RegMutex.WaitOne(5000); }
+                catch (System.Threading.AbandonedMutexException) { gotLock = true; }   // 上一个持有者崩溃,锁已释放
+                if (!gotLock) return FallbackSelf(study, wantBrain);
 
-            var me = all.FirstOrDefault(x => x.IsSelf) ?? new PsInstanceInfo { Pid = SelfPid };
+                try
+                {
+                    var all = All();
+                    var existingBrain = all.FirstOrDefault(x => x.IsBrain && x.IsAlive && !x.IsSelf);
+
+                    me = all.FirstOrDefault(x => x.IsSelf) ?? new PsInstanceInfo { Pid = SelfPid };
+                    me.Study = study;
+                    me.HeartbeatUtc = DateTime.UtcNow;
+                    me.IsBrain = wantBrain && existingBrain == null;
+
+                    if (string.IsNullOrWhiteSpace(me.Name))
+                        me.Name = MakeName(study, all);
+
+                    File.WriteAllText(PathFor(SelfPid),
+                        JsonConvert.SerializeObject(me, Formatting.Indented), Encoding.UTF8);
+                }
+                finally { RegMutex.ReleaseMutex(); }
+            }
+            catch { /* 锁或 I/O 异常时走兜底:尽量把本实例写出去 */ }
+
+            if (me == null) me = FallbackSelf(study, wantBrain);
+            return me;
+        }
+
+        /// <summary>拿不到互斥锁时的兜底:不重判角色,仅刷新心跳,沿用上次判定。</summary>
+        private static PsInstanceInfo FallbackSelf(string study, bool wantBrain)
+        {
+            var me = All().FirstOrDefault(x => x.IsSelf) ?? new PsInstanceInfo { Pid = SelfPid };
             me.Study = study;
             me.HeartbeatUtc = DateTime.UtcNow;
-            me.IsBrain = wantBrain && existingBrain == null;
-
             if (string.IsNullOrWhiteSpace(me.Name))
-                me.Name = MakeName(study, all);
-
+                me.Name = MakeName(study, All());
             try
             {
                 File.WriteAllText(PathFor(SelfPid),
                     JsonConvert.SerializeObject(me, Formatting.Indented), Encoding.UTF8);
             }
             catch { }
-
             return me;
+        }
+
+        // ── Agent 窗口独占 ──
+        // 目的:同时开两个 PDPS 时，Agent 窗口全局至多开一个。
+        // 晚打开的那个显示提示信息，不进入对话界面 —— 避免两个窗口
+        // 各自加载同一会话、SaveCurrent 整份覆盖互相抹掉。
+        //
+        // 用与 RegMutex 同款的跨进程命名互斥体串行化"查-置"，
+        // 避免两个进程同时点开都各自抢到窗口。
+
+        private static readonly System.Threading.Mutex WindowMutex =
+            new System.Threading.Mutex(false, @"Local\TxAgent_Window_Mutex");
+
+        /// <summary>
+        /// 尝试独占 Agent 窗口。成功返回 true（本进程是唯一窗口）；
+        /// 失败返回 false（已有其它活进程开着窗口）。
+        /// </summary>
+        public static bool TryAcquireWindow()
+        {
+            bool gotLock = false;
+            try
+            {
+                try { gotLock = WindowMutex.WaitOne(5000); }
+                catch (System.Threading.AbandonedMutexException) { gotLock = true; }
+                if (!gotLock) return true;   // 拿不到锁：不阻断，允许打开（宁可不误伤）
+
+                try
+                {
+                    var live = Live();
+                    foreach (var i in live)
+                    {
+                        if (i.HasWindow && i.IsAlive && !i.IsSelf)
+                            return false;
+                    }
+
+                    var me = Self() ?? new PsInstanceInfo { Pid = SelfPid };
+                    me.HasWindow = true;
+                    me.HeartbeatUtc = DateTime.UtcNow;
+                    if (string.IsNullOrWhiteSpace(me.Name))
+                        me.Name = MakeName(me.Study, All());
+                    File.WriteAllText(PathFor(SelfPid),
+                        JsonConvert.SerializeObject(me, Formatting.Indented), Encoding.UTF8);
+                    return true;
+                }
+                finally { WindowMutex.ReleaseMutex(); }
+            }
+            catch { return true; }   // 锁机制失效时不阻断正常使用
+        }
+
+        /// <summary>释放窗口独占（窗口关闭时调用）。</summary>
+        public static void ReleaseWindow()
+        {
+            try
+            {
+                var me = Self();
+                if (me == null) return;
+                me.HasWindow = false;
+                File.WriteAllText(PathFor(SelfPid),
+                    JsonConvert.SerializeObject(me, Formatting.Indented), Encoding.UTF8);
+            }
+            catch { }
         }
 
         /// <summary>心跳。定期调用，否则别的实例会认为本进程已死。</summary>

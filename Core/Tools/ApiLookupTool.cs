@@ -26,7 +26,9 @@ namespace TxTools.Agent.Core
                 return "查询 PDPS (Tecnomatix.Engineering) 类型的真实成员与完整签名，直接反射当前进程已加载的程序集，结果100%准确。"
                      + "【写任何 run_csharp / run_python 代码之前，只要用到不确定的类型或方法，先用本工具确认签名，不要用 probe_python 去猜。】"
                      + "参数 type 支持简名(TxWeldOperation)或全名；member 可填成员名或片段做过滤；"
-                     + "不确定类型叫什么时用 search 做模糊搜索；不确定哪个类型有某方法时用 member_search。"
+                     + "不确定类型叫什么时用 search 做模糊搜索；不确定哪个类型有某方法时用 member_search；"
+                     + "想知道【谁接收或返回某个类型】(例如哪个方法吃 TxLibraryData) 用 signature_search —— "
+                     + "找一个数据类的消费者往往是摸清整条 API 链路的关键。"
                      + "返回内容会附带该类型的历史踩坑注解(如某方法已废弃、某属性 setter 会抛异常)。";
             }
         }
@@ -45,6 +47,7 @@ namespace TxTools.Agent.Core
     ""kind"":          { ""type"": ""string"", ""description"": ""可选。只看某类成员：method / property / field / event / ctor"" },
     ""search"":        { ""type"": ""string"", ""description"": ""可选。类型名模糊搜索关键字，与 type 二选一"" },
     ""member_search"": { ""type"": ""string"", ""description"": ""可选。跨所有类型搜成员名，用于'哪个类型有这个方法'"" },
+    ""signature_search"": { ""type"": ""string"", ""description"": ""可选。跨所有类型搜签名文本，用于'谁接收/返回这个类型'"" },
     ""inherited"":     { ""type"": ""boolean"", ""description"": ""可选，默认 false。是否包含继承来的成员"" }
   }
 }");
@@ -60,9 +63,13 @@ namespace TxTools.Agent.Core
             var kind = Str(input, "kind");
             var search = Str(input, "search");
             var memberSearch = Str(input, "member_search");
+            var signatureSearch = Str(input, "signature_search");
             bool inherited = input["inherited"] != null && (bool)input["inherited"];
 
             ApiIndex.EnsureBuilt();
+
+            if (!string.IsNullOrWhiteSpace(signatureSearch))
+                return RenderSignatureSearch(signatureSearch);
 
             if (!string.IsNullOrWhiteSpace(memberSearch))
                 return RenderMemberSearch(memberSearch);
@@ -183,6 +190,17 @@ namespace TxTools.Agent.Core
             foreach (var h in hits) sb.AppendLine("  " + h);
             if (hits.Count == 0) sb.AppendLine("  (无)");
             else sb.AppendLine("用 type=<名称> 查看具体成员。");
+            return sb.ToString();
+        }
+
+        private static string RenderSignatureSearch(string keyword)
+        {
+            var hits = ApiIndex.SearchSignatures(keyword, 60);
+            var sb = new StringBuilder();
+            sb.AppendLine("签名中含 \"" + keyword + "\" 的成员，命中 " + hits.Count + " 条:");
+            foreach (var h in hits) sb.AppendLine("  " + h);
+            if (hits.Count == 0)
+                sb.AppendLine("  (无。该类型可能只出现在构造函数里，或拼写不符)");
             return sb.ToString();
         }
 

@@ -385,6 +385,11 @@ namespace TxAgent.Core
 
                     if (toolResult.MutatedScene) result.SceneMutated = true;
 
+                    // 注:片段观察(Observe)放在工具层(RunCSharpTool/RunPythonTool)做 ——
+                    // 内核不该硬编码"run_csharp"这个工具名去感知片段库;
+                    // 且只有工具层才知道编译失败 vs 返回值成功,harness 的 toolResult.Success
+                    // 会把编译失败的代码当成成功。放工具层还能让 python 通道共用同一套挂钩。
+
                     // 先更新连续失败计数，再据此决定回灌文本要不要带"换思路"提示
                     int consecutive = 0;
                     if (toolResult.Success)

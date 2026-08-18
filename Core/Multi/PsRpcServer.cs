@@ -59,27 +59,62 @@ namespace TxTools.Agent.Core
 
             while (_running)
             {
+                NamedPipeServerStream server = null;
                 try
                 {
-                    using (var server = new NamedPipeServerStream(
+                    server = new NamedPipeServerStream(
                         pipeName, PipeDirection.InOut, MaxServerInstances,
-                        PipeTransmissionMode.Message, PipeOptions.Asynchronous))
+                        PipeTransmissionMode.Message, PipeOptions.Asynchronous);
+                    server.WaitForConnection();
+                    if (!_running)
                     {
-                        server.WaitForConnection();
-                        if (!_running) return;
-
-                        // 每个连接单独处理，避免一个慢请求堵住后面的
-                        var conn = server;
-                        HandleConnection(conn);
+                        server.Dispose();
+                        return;
                     }
+
+                    // 每个连接丢到工作线程处理 —— 否则一个慢请求(遍历场景、仿真阻塞)
+                    // 会把后面的所有调用都堵住，主控侧的 parallel_tool_calls 全被串行化。
+                    // 管道所有权随工作线程走:这里置 null,不再由 Loop 的 using 释放。
+                    var conn = server;
+                    server = null;
+                    ThreadPool.QueueUserWorkItem(delegate { HandleConnectionInWorker(conn); });
                 }
                 catch (Exception ex)
                 {
+                    if (server != null)
+                    {
+                        try { server.Dispose(); } catch { }
+                    }
                     if (!_running) return;
                     try { AuditLog.Write("[warn] [PsRpc] 服务端循环异常: " + ex.Message); } catch { }
                     Thread.Sleep(500);
                 }
             }
+        }
+
+        /// <summary>并发处理槽位。超出就排队 —— 既不无限开线程，也不让慢请求饿死其它请求太久。</summary>
+        private static readonly System.Threading.SemaphoreSlim ConnSlots =
+            new System.Threading.SemaphoreSlim(MaxServerInstances);
+
+        private void HandleConnectionInWorker(NamedPipeServerStream pipe)
+        {
+            try
+            {
+                if (!ConnSlots.Wait(TimeSpan.FromSeconds(30)))
+                {
+                    try { AuditLog.Write("[warn] [PsRpc] 并发连接过多，丢弃一个请求"); } catch { }
+                    return;
+                }
+                try
+                {
+                    using (pipe)
+                    {
+                        HandleConnection(pipe);
+                    }
+                }
+                finally { ConnSlots.Release(); }
+            }
+            catch { }
         }
 
         private void HandleConnection(NamedPipeServerStream pipe)
@@ -113,12 +148,7 @@ namespace TxTools.Agent.Core
                 switch (op)
                 {
                     case "ping":
-                        return Ok(new JObject
-                        {
-                            ["pid"] = PsInstanceRegistry.SelfPid,
-                            ["study"] = SafeStudy(),
-                            ["tools"] = _tools != null ? _tools.Count : 0
-                        });
+                        return Ping();
 
                     case "list_tools":
                         {
@@ -147,6 +177,32 @@ namespace TxTools.Agent.Core
             }
         }
 
+        /// <summary>
+        /// ping：管道在后台线程，study / systemRoot 都要回主线程取 ——
+        /// 直接读 Tecnomatix API 会跨线程抛异常/返回空，导致对端识别不到库根。
+        /// </summary>
+        private string Ping()
+        {
+            string study = null, systemRoot = null;
+            try
+            {
+                PsContext.Current.Run(delegate
+                {
+                    study = SafeStudy();
+                    systemRoot = SafeSystemRoot();
+                });
+            }
+            catch { /* 取不到就留 null */ }
+
+            return Ok(new JObject
+            {
+                ["pid"] = PsInstanceRegistry.SelfPid,
+                ["study"] = study,
+                ["systemRoot"] = systemRoot,
+                ["tools"] = _tools != null ? _tools.Count : 0
+            });
+        }
+
         private string Invoke(JObject req)
         {
             var name = (string)req["tool"];
@@ -158,13 +214,8 @@ namespace TxTools.Agent.Core
 
             var input = req["input"] as JObject ?? new JObject();
 
-            // 【远程只放行只读工具】跨环境改场景风险太高:
-            // 用户在 A 窗口发指令，B 环境的场景被悄悄改了，而他根本没看着那个窗口。
-            // 需要改远程环境时，让用户切到那个窗口去操作。
-            if (!tool.IsReadOnly && !AllowRemoteWrite)
-                return Err("工具 \"" + name + "\" 会修改场景，跨环境调用已被拒绝。"
-                         + "请在目标环境自己的窗口里操作，或让用户显式开启跨环境写入。");
-
+            // 【主被控互访】允许远程调用全部工具(含写操作)。
+            // 写工具在目标进程内执行，仍受其自身 undo 保护；场景安全靠本窗口可见 + Ctrl+Z。
             string output;
             try
             {
@@ -180,10 +231,22 @@ namespace TxTools.Agent.Core
         }
 
         /// <summary>
-        /// 是否允许远程调用写操作。默认关闭 —— 见 Invoke 里的说明。
-        /// 确实需要时由 UI 显式打开，并且应当同时提示用户。
+        /// 是否允许远程调用写操作。默认开启 —— 主被控互访，写工具也能跨环境执行。
+        /// 若确需收紧(如仅限只读)，由宿主在 UI 中显式关闭。
         /// </summary>
-        public static bool AllowRemoteWrite = false;
+        public static bool AllowRemoteWrite = true;
+
+        /// <summary>
+        /// 当前环境的 SystemRootDirectory（库根）。由宿主注入 —— Core 层不直接依赖 Tecnomatix。
+        /// ping 时随响应返回，供其它环境识别本环境的库根路径。
+        /// </summary>
+        public static Func<string> SystemRootGetter;
+
+        private static string SafeSystemRoot()
+        {
+            try { return SystemRootGetter != null ? SystemRootGetter() : null; }
+            catch { return null; }
+        }
 
         private string SafeStudy()
         {

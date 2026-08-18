@@ -144,22 +144,6 @@ namespace TxTools.Agent.Core
             lock (_sync) { return new List<string>(_enabled); }
         }
 
-        /// <summary>过滤工具集合。返回被挡掉的数量,便于日志与状态栏提示。</summary>
-        public static List<ITxAgentTool> Filter(IEnumerable<ITxAgentTool> tools, out int blocked)
-        {
-            blocked = 0;
-            var outList = new List<ITxAgentTool>();
-            if (tools == null) return outList;
-
-            foreach (var t in tools)
-            {
-                if (t == null) continue;
-                if (ShouldExpose(t.Name)) outList.Add(t);
-                else blocked++;
-            }
-            return outList;
-        }
-
         /// <summary>给系统提示词用的一行说明:告诉模型哪些能力当前不可用。</summary>
         public static string DescribeDisabled()
         {
