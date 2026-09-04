@@ -179,10 +179,10 @@ namespace TxTools.Agent
             reg.Register(new DeleteRecipeTool(reg));
 
             // 3) 记忆系统工具 (v2) —— 跨对话记忆的读写入口
-            //    convId 通过 AgentLoop.Current / HarnessAgentLoop.Current 静态入口获取。
+            //    convId 通过 HarnessAgentLoop.Current 静态入口获取。
             //    form 构造 loop 后写入 Current,lambda 每次调用时读取,即使 Current 为 null 也返回 null 不崩。
             var getConvId = new Func<string>(() =>
-                AgentLoop.Current?.CurrentConvId ?? TxTools.Agent.Harness.HarnessAgentLoop.Current?.CurrentConvId);
+                TxTools.Agent.Harness.HarnessAgentLoop.Current?.CurrentConvId);
 
             // 片段固化/归因需要 convId:统一注入 AgentContext,工具层挂钩共用同一个来源
             AgentContext.ConvIdProvider = getConvId;

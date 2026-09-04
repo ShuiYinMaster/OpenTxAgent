@@ -187,7 +187,10 @@ namespace TxTools.Agent.Core
                 bool completed = ar != null && done.WaitOne(timeoutMs);
                 if (!completed)
                 {
-                    try { pipe.EndRead(ar); } catch { }
+                    // 关键修复:超时后不能调用 EndRead —— 它在读取未完成时会阻塞到读完成,
+                    // 让"超时"形同虚设(对端活着但不回数据时永久挂起)。
+                    // 改为关闭管道,让挂起的 BeginRead 以异常结束,立刻返回超时。
+                    try { pipe.Close(); } catch { }
                     return false;
                 }
                 try { n = pipe.EndRead(ar); }

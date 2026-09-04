@@ -1,0 +1,24 @@
+# Local build and editor output
+artifacts/
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.dll
+*.exe
+*.pdb
+*.bak*
+*.tmp
+*.log
+# Runtime state and credentials (never publish)
+*.key
+.env
+.env.*
+prefs.json
+conversation.json
+conversations/
+memory/
+maintenance-backup/
+*.migrated
