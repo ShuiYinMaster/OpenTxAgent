@@ -1,10 +1,20 @@
 # TxTools.Agent (TxAgent)
 
-嵌入 **Siemens Tecnomatix Process Simulate 2402** 的 AI 助手插件——通过 LLM 调用 30+ 内置工具查询、操作 PS 场景,并把踩过的坑固化成记忆持久保留。
+嵌入 **Siemens Tecnomatix Process Simulate 2402** 的 AI 助手插件——通过 LLM 调用按组启用的内置工具查询、操作 PS 场景,并把踩过的坑固化成记忆持久保留。
 
-- **平台**:.NET Framework 4.8 / C# 7.3
+- **平台**:.NET Framework 4.8；当前宿主工程使用 C# 8.0，`run_csharp` 的传统编译器限制另计
 - **运行环境**:作为 PS 插件加载到 PS 进程内
-- **仓库**:[ShuiYinMaster/TxTools](https://github.com/ShuiYinMaster/TxTools)
+- **仓库**:[ShuiYinMaster/OpenTxAgent](https://github.com/ShuiYinMaster/OpenTxAgent)
+- **集成宿主**:[TxTools](https://github.com/ShuiYinMaster/TxTools)；本仓库是 Agent 源码子树，不含独立 `.csproj`、完整宿主或专有 SDK。
+- **文档更新**:2026-09-04，按源码提交 `d7433b9` 核对。
+
+## 当前进度
+
+已实现：统一 Harness 循环、真实 SSE 流式、官方 DeepSeek V4 默认低强度思考、工具优先的查询/对比/验证流程、独立思考归档、原子保存与备份回退、记忆筛选和可恢复清理。
+
+验证状态：在现有 TxTools 宿主工程中隔离编译通过，24 项离线回归及 HTML 内联 JavaScript 语法检查通过。新版本已在维护环境部署；未进行此次变更后的付费模型联调或 PS/CATIA 场景变更回归，不能把离线通过等同于真实场景验收。
+
+维护工具与测试边界见 [maintenance/README.md](maintenance/README.md)。仓库不包含本机对话、运行记忆、API Key、偏好配置和部署备份。
 
 ---
 
@@ -16,7 +26,7 @@
 | 调 LLM | [多 LLM Provider](#多-llm-provider) → `DeepSeekClient` 是 OpenAI 兼容 |
 | 改 UI | [WebView2 + chat.html](#前端-webview2--chathtml) → 单文件 HTML+CSS+JS |
 | 加记忆条目 | [记忆系统](#记忆系统) → Snippet/Fact/Gotcha,一物一 Markdown 文件 |
-| 换循环引擎 | [Agent Harness](#agent-harness-txagentcore) → `TxAgentForm.UseNewHarness` 一个常量切换 |
+| 改循环引擎 | [Agent Harness](#agent-harness-txagentcore) → 当前唯一入口为 `HarnessAgentLoop` |
 | 查 PS API 签名 | [API 知识库](#api-知识库) → `api_lookup` 直接反射,不用再 probe |
 | 挂本地资料 | [本地知识库](#本地知识库) → md 丢进 `memory/knowledge/`,支持语义检索 |
 | 让 AI 看图 | [图像识别](#图像识别) → `analyze_image` / `analyze_viewport`,委托给视觉模型 |
@@ -28,54 +38,20 @@
 
 ## 架构总览
 
-```
-                    ┌─────────────────────────────────┐
-                    │      TxAgentForm (WinForm)      │
-                    │   ┌───────────────────────┐     │
-                    │   │   WebView2 (Chromium) │     │
-                    │   │      chat.html        │     │
-                    │   └───────────────────────┘     │
-                    └─────────────┬───────────────────┘
-                                  │ postMessage / PostJs
-                    ┌─────────────┴───────────────────┐
-                    │           IAgentLoop            │
-                    │  UI 只依赖接口,引擎可整体替换   │
-                    └──┬───────────────────────────┬──┘
-                       │                           │
-          ┌────────────▼──────────┐   ┌────────────▼─────────────┐
-          │  AgentLoop (旧·自研)  │   │  HarnessAgentLoop (新)   │
-          └────────────┬──────────┘   └────────────┬─────────────┘
-                       │                           │ 驱动
-                       │                ┌──────────▼──────────────┐
-                       │                │  TxAgent.Core.AgentLoop │
-                       │                │  宿主无关的 harness 内核 │
-                       │                └──────────┬──────────────┘
-                       │                           │
-                    ┌──┴───────────────────────────┴────────────┐
-                    │                                           │
-                       │             │            │
-              ┌────────▼──────┐ ┌───▼────┐ ┌────▼─────┐
-              │ DeepSeekClient│ │ Tools  │ │ Memory   │
-              │ (LLM HTTP)    │ │ (30+)  │ │ Stores   │
-              └───────────────┘ └───┬────┘ └──────────┘
-                                    │
-                            ┌───────▼───────┐
-                            │ Tecnomatix    │
-                            │ Engineering   │
-                            │ SDK           │
-                            └───────────────┘
+```text
+chat.html / recipe-sidebar.js
+  → TxAgentForm → IAgentLoop → HarnessAgentLoop
+      → TxAgent.Core.AgentLoop
+          → DeepSeekLlmClient → DeepSeekClient → 模型端点
+          → TxAgentToolAdapter → PS 工具 / 宿主主线程
+          → AgentSession（工作上下文）
+      → ConversationStore（完整归档）+ ConversationIndex（检索索引）
+      → SystemPromptBuilder / Memory Stores（按需经验）
 ```
 
-**关键路径**(用户发消息 → AI 回复):
+用户输入经 WebView2 消息桥进入 `SendAsync`，模型 SSE 先产生思考/正文，再产生完整工具调用；工具结果回灌模型，直到结束或停止。工具结果先加入 session，再触发完成事件和增量归档；一轮结束和正常关闭另有保存兜底。
 
-1. `chat.html` `postMessage` → `TxAgentForm.dispatchMessage`
-2. → `_loop.SendAsync(userText)`(`_loop` 是 `IAgentLoop`,新旧引擎二选一)
-3. → `DeepSeekClient.SendStreamAsync`,SSE 分片实时回调
-4. LLM 返回工具调用 → 在后台线程执行,需要 PS SDK 的封送回主线程
-5. 结果通过事件回调 → 前端流式渲染
-6. 每步 history 变化 → `SaveCurrent` 增量落盘 + 重建 Markdown 摘要索引
-
----
+`Core/AgentLoop.cs` 目前保留 `AgentOptions` 与默认提示词，不是可切换的旧循环。实际循环位于 `Core/Harness/AgentLoop.cs`。
 
 ## Agent Harness (TxAgent.Core)
 
@@ -93,13 +69,9 @@
 | 适配层 | `PsAgentHost` / `DeepSeekLlmClient` / `TxAgentToolAdapter` | 是 |
 | 桥接层 | `HarnessAgentLoop` — 用旧 UI 表面驱动新内核 | 是 |
 
-现有 30+ 工具、`DeepSeekClient`、`PsContext`、`AuditLog` **全部不动**,
-只在外面套三层适配器。UI 只认 `IAgentLoop` 接口,切换引擎改一个常量:
+当前 UI 的 `BuildLoop` 始终构造 `HarnessAgentLoop`，没有 `UseNewHarness` 切换开关。协议、工具、记忆与界面已持续迭代，不再属于“只加适配、原文件完全不动”的接入阶段。
 
-```csharp
-// Agent/UI/TxAgentForm.cs
-private const bool UseNewHarness = true;
-```
+入口和事件契约详见 [Harness 接入说明](Core/Harness/README_Harness接入.md)。
 
 ### 内核提供的能力
 
@@ -139,11 +111,22 @@ public interface ITxOffUiThreadTool { }   // 标记接口,禁止封送
 
 | Provider | Base URL | 密钥存储 |
 |---|---|---|
-| DeepSeek | `https://api.deepseek.com/v1` | DPAPI 加密 |
-| Kimi (Moonshot) | `https://api.moonshot.cn/v1` | DPAPI 加密 |
-| Qwen (Dashscope 兼容模式) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | DPAPI 加密 |
-| OpenAI | `https://api.openai.com/v1` | DPAPI 加密 |
-| Ollama (本地) | `http://localhost:11434/v1` | 无 |
+| DeepSeek | `https://api.deepseek.com` | DPAPI 加密 |
+| Kimi (Moonshot) | `https://api.moonshot.cn` | DPAPI 加密 |
+| Qwen (Dashscope 兼容模式) | `https://dashscope.aliyuncs.com/compatible-mode` | DPAPI 加密 |
+| OpenAI | `https://api.openai.com` | DPAPI 加密 |
+| Ollama (本地) | `http://localhost:11434` | 无 |
+
+上述是传给构造函数的 Base URL；客户端追加 `/v1/chat/completions` 和 `/v1/models`，不要重复附加 `/v1`。内置模型清单仅是兜底，实际可用性以端点返回及账户权限为准。
+
+### 默认思考与输出预算
+
+- `UserPrefs.ReasoningEffort` 默认为 `low`，允许 `high` / `max`；非法值归一为 `low`。配置在构造循环时读取，修改后重新打开智能体或重建循环。
+- 仅当端点主机为 `api.deepseek.com`、模型名以 `deepseek-v4` 开头时发送 `reasoning_effort`。其他模型/代理不发送该专有配置，保留服务端默认。
+- 官方 V4 携带工具时回传历史 `reasoning_content`；其他请求默认排除。历史没有思考时不会编造补写。协议依据见 [DeepSeek 文档](https://api-docs.deepseek.com/guides/thinking_mode/)。
+- DeepSeek V4、Kimi K2/K3、Qwen3 的单次输出上限为 12,288 tokens，其余分支为 8,192；这是推理与正文共用的上限，不是单独思考预算。`AgentOptions.MaxTokens=4096` 不是当前 Harness 实际使用的预算。
+- 宿主默认最多 50 次模型往返；裸 `AgentLoopOptions` 默认 25，桥接层会覆盖。低强度不保证固定响应时长，也不放宽审批或验证要求。
+- 提示词要求先用专用工具/API 查询、脚本对比/差集筛查，再最小变更、读回复核，减少手算和反复猜测；不要为纯闲聊或已有答案额外调用工具。
 
 **核心机制**:
 
@@ -158,7 +141,7 @@ public interface ITxOffUiThreadTool { }   // 标记接口,禁止封送
 
 ## 工具系统
 
-**30+ 内置工具**,按类别:
+内置工具按类别组织，实际暴露集合由注册表与 `ToolGate` 决定，不固定写死数量。默认启用 `doc/view/catia/knowledge`，`code/cee` 默认关闭，未分组的核心工具始终启用；保存的用户配置可覆盖默认值，切换工具组在新建对话时生效。
 
 ### 场景查询(只读)
 `count_objects` / `list_children` / `list_operations` / `find_objects` / `list_types` / `inspect_type` / `inspect_object` / `get_object_location` / `check_reachability`
@@ -257,74 +240,57 @@ public interface ITxAgentTool
 
 ## 记忆系统
 
-四类知识 + 对话归档 + 一层跨对话检索。
+当前采用分类 Markdown 经验库、JSON 对话归档和派生检索索引，二者职责分开。
 
-### 存储介质:Markdown 而非 JSON
+### 存储介质与默认注入
 
-知识类存储从 JSON 换成了**一物一 Markdown 文件**:
-
-```
+```text
 memory/
-  snippets/scan_physical_root_for_robots.md
-  gotchas/CS1061_TxDocument_FullPath.md
-  facts/用户偏好复用现有工具而非run_csharp.md
-  api-notes/TxWeldOperation.md
+  facts/       偏好、API 事实、场景快照、流程经验
+  gotchas/     错误签名、触发代码、确认后的正解
+  snippets/    C# / Python 可复用片段
+  pending/     待验证片段
+  recipes/     脚本配方及参数声明
+  knowledge/   文档与向量索引
 ```
 
-换的理由:
+`MarkdownDoc` 处理轻量 frontmatter。部分旧 JSON 由对应 Store 迁移成 Markdown，原文件保留为 `*.migrated`；不要推断所有旧格式都已自动迁移。`api_note` 的运行期行为注释目前在 `%APPDATA%/TxTools/TxAgent/api_notes.json`，不是 `memory/api-notes`。
 
-- **可读可改** —— snippet 存的是 C# 代码,JSON 里是 `"var doc = ...\r\n  foreach ..."` 这种转义地狱;
-  MD 里是围栏代码块,能直接看、直接改、直接复制。
-- **Git 友好** —— JSON 里一条记录是一整行长字符串,改一个字符 diff 显示整行重写;MD 逐行 diff。
-- **并发与体积** —— 写一条只动一个小文件,不用整份读-改-写。
-- **注入省 token** —— 内容可原样拼进 prompt,不必反序列化后再格式化。
-
-`MarkdownDoc` 是自己写的极简 frontmatter 解析器(五十行,零依赖)。
-**没有引 YamlDotNet** —— 多一个第三方程序集就多一处和 PS 自带 DLL 撞版本的风险。
-
-各 Store 的**公开 API 完全不变**,只是底下换了存储介质,所以调用点一行都不用改。
-首次访问时若 MD 目录为空且找得到旧 JSON,自动逐条迁移,旧文件改名成 `*.migrated` 而非删除。
-
-`RecipeStore` 保留 JSON —— 纯结构化步骤数据,没有代码块也没有散文,MD 化收益接近零。
-
+`SystemPromptBuilder` 会话级缓存基础提示；开新/切换对话时失效。默认最多注入 **6 条 preference/api_fact + 5 条有正解的 gotcha**，不再把场景快照和未解决错误作为全局前提。历史经验有冲突时，以当前工具实测为准。
 
 ### `SnippetStore` — 代码片段库
-- 存 `run_csharp` 里跑通过的可复用代码
-- **语义标签自动提取**:ExtractTags 扫描代码里的 API 关键词(`TxRobot` / `WeldPoint` / `AbsoluteLocation` 等)生成标签
-- **相关性检索**:每轮 `SendAsync` 用当前 userText 检索 Top-3 最相关片段,作为 system 消息注入本轮(不进 history),仅本轮有效
-- 使用计数:`get_snippet` 时 `IncrementUsage`,越用越靠前
 
-### `FactsStore` — 事实/偏好
-- 跨对话保留的常量(用户偏好、场景固定值、验证过的 SDK 事实)
-- 每轮 system prompt 头部注入 Top-10
+- 支持 C# / Python、标签检索及成功/失败/未决归因；`get_snippet` 只是登记候选，不能算成功执行。
+- 每次 `SendAsync` 按输入检索最多 3 个片段，临时注入本轮，结束后移除，不把整库塞进上下文。
+- `PendingSnippetStore.EnableAutoPromotion=false`：重复执行三次不再默认晋升。验证结果和适用范围后再手动固化。
+- 过期候选读取时只过滤；需要物理清理时使用可恢复的维护流程。
 
-### `GotchasStore` — 踩坑记录
-- 签名(问题模式) + 正解
-- `run_csharp` 编译失败自动落库
-- 每轮 system prompt 末尾注入 Top-15
+### `FactsStore` / `GotchasStore`
+
+事实库可保留流程线索，但场景 ID、数量、坐标不是跨工程常量。事实的默认注入仅取偏好/API 类别，并对完全相同内容去重。错误经验由工具输出记录；只有明确正解才进入默认避坑清单，其他记录仍可用于诊断。
 
 ### `RecipeStore` — 配方
-- 用户可视化定义"多步流程 → 单个新工具"
-- `RecipeTool` 是通用 wrapper,实际每次执行时按 recipe 定义的 step 序列调其他工具
-- 加载时**注册成正式工具**,AI 视角跟内置工具无差
+
+当前配方是 **脚本 + 参数声明**，由 `memory/recipes/*.md` 读取，支持配方侧栏与工具调用。参数值按当前场景绑定，不写入通用配方文件；运行统计不等同于所有场景都已验证。
+
+旧 `recipes.json` 是多步骤工具编排格式，仍可保留作历史资料，但当前 `RecipeStore.All()` 不读取它，也不自动迁移为脚本配方。`Core/Recipe.cs` 是遗留模型文件，与现行 `RecipeStore.cs` 内类型重名，不能盲目通配编译所有源码。
 
 ### `ConversationStore` — 对话持久化
-- 每对话一个 JSON 文件在 `{plugin}\conversations\{id}.json`。
-  **这一份必须保持 JSON** —— 它是协议原样存档,要能无损重放回 API:
-  `tool_call_id` 配对、`arguments` 本身是 JSON 字符串、role 枚举、消息顺序。
-- **增量保存**:`HistoryChanged` 事件在每次 `_fullHistory.Add` 后 raise → `SaveCurrent` 立即写盘
-- **崩溃兜底**:`FormClosing` + `AppDomain.UnhandledException` 双保险
-- PS 硬崩溃最多丢当前正在执行的**那一个**工具
 
-**归档与工作记忆必须分开**:
+- 每对话一个 `conversations/{id}.json`，当前写入 `SchemaVersion=2`，紧凑序列化；旧格式仍可读取，不批量改写旧历史。
+- 存储专用 resolver 保存模型返回的 `reasoning_content`；网络序列化按端点/模型决定回传，归档不能直接原封不动作为请求发送。
+- 正常完成、取消、最终调用失败及只返回思考的响应均有保留路径。历史 UI 默认折叠思考；旧版本未保存的思考无法补回。
+- 同目录临时文件写入并 flush 后原子替换，保留一个 `.json.bak`；主文件损坏时尝试读取备份，保存失败写日志。
+- 列表优先读取头部元数据，避免为显示标题反序列化整个消息数组。仍保留单文件快照方式，非逐 token WAL。
+- 工具完成事件在结果入 session 后触发；归档用消息对象身份去重，避免工作上下文裁剪后索引错位。
 
-| | 用途 | 可否压缩 |
+| 数据 | 用途 | 处理方式 |
 |---|---|---|
-| `_workingMemory` | 喂给 LLM 的上下文,可注入临时内容、可重建 | 可 |
-| `_fullHistory` | 归档,`SaveCurrent` 落盘的就是它 | **只增不改** |
+| `_workingMemory` | 本轮模型上下文 | 可裁剪、摘要、临时注入 |
+| `_fullHistory` | 完整交互归档 | 常规同步追加，不被摘要替换；显式撤销/删除另行处理 |
+| `reasoning_content` | 模型返回的过程记录 | 保存供回看，不自动视为事实或成功结论 |
 
-两者混用会出严重事故:harness 早期版本用压缩后的工作记忆整份覆盖归档,
-于是每压缩一次,磁盘上的原始对话就被摘要覆盖一次——不是"检索不到",是内容真的没了。
+原子替换降低文件截断风险，不保证强杀、断电或 native 崩溃时最后的流式片段一定保存。
 
 ### `ConversationIndex` — 对话摘要索引
 
@@ -349,7 +315,7 @@ turns: 6
 **工具名和 PS 类型名是最强的语义锚点**,检索时 `tools`/`types` 权重 3、标题 5、正文 1。
 搜 `TxWeldOperation` 就能捞出所有碰过焊接操作的对话,这是纯正文关键词做不到的。
 
-摘要用规则拼装,**不调 LLM** —— 免费、零延迟;`messages` 数没变就跳过重写,每轮开销接近零。
+摘要用规则拼装，**不调 LLM**，不产生额外模型调用费用，但仍有文件读写和处理开销；消息数未变时可跳过重写。
 
 检索是两段式:`search_past_conversations` 只扫索引,拿到 id 后用
 `read_past_conversation(conv_id, query?)` 按需读原始 JSON 取细节。
@@ -484,7 +450,7 @@ DeepSeek 系列不支持视觉。两条路：
 | | `run_csharp` 沙箱 | `code_build` |
 |---|---|---|
 | 编译器 | `CSharpCodeProvider`（CodeDom） | MSBuild → Roslyn |
-| 语法上限 | **C# 5** | C# 7.3 起，跟 VS 版本走 |
+| 语法上限 | **C# 5** | 以目标工程 LangVersion 为准；当前宿主为 C# 8.0 |
 
 系统提示词里那堆「C# 5 语法陷阱」**只对 `run_csharp` 成立**。
 
@@ -497,13 +463,14 @@ DeepSeek 系列不支持视觉。两条路：
 
 ## 前端 (WebView2 + chat.html)
 
-**技术选型**:WebView2 (Chromium) 嵌入 WinForm,前端单文件 `chat.html` 包含所有 HTML/CSS/JS。
+**技术选型**:WebView2 (Chromium) 嵌入 WinForm,主体为 `UI/chat.html`，配方侧栏另有 `recipe-sidebar.css` / `recipe-sidebar.js`，由宿主嵌入资源加载。
 
 **核心 UI 特性**:
 
 - **流式 markdown 渲染**:`renderMarkdownStreaming` 检测未闭合 ` ``` `,自动补尾,避免流式过程"代码块闪现"
 - **合并气泡**:一整轮 AI 回复共用**一个"助手"标签**和大气泡容器,内部按时序交错文字段和工具卡片(`state.currentAssistantMsg` 生命周期到 `onBusy(false)` 才结束)
 - **工具卡片折叠**:默认 `collapsed`,头部 `▸/▾` 箭头指示,状态徽章 `[已完成]/[失败]`
+- **思考记录**: SSE 推送 `reasoningStart/Delta/End`；保存后重开历史可折叠查看模型实际返回的内容。
 - **思考动画**:空档期(`onCloseAssistant` 后 / `onToolResult` 后)都会重新显示,覆盖多轮 tool_call 之间的等待
 - **侧滑 drawer**:历史对话 + 可用工具面板都用同款 drawer(右滑,420px),复用 `.drawer-head` 样式
 - **HTML modal**:审批(allow/deny)+ 用户提问(五种形态),走 `TaskCompletionSource` 桥接同步阻塞
@@ -710,47 +677,41 @@ read_uploaded_file(file_id="...", line_from=45, line_to=80)
 
 ## 可靠性
 
-**对话持久化的四层保护**:
+**对话持久化保护**：
 
-1. 每次 `_fullHistory.Add` (user/assistant/tool 三类) → `HistoryChanged` → `SaveCurrent` 立即写盘
-2. 一轮 `SendAsync` finally 兜底 raise 一次
-3. `FormClosing` 兜底
-4. `AppDomain.CurrentDomain.UnhandledException` 兜底(.NET 侧未捕获异常)
+1. 用户输入、工具结果及一轮结束的历史同步触发保存；不承诺每个 token 立即落盘。
+2. `FormClosing` 和 .NET 未处理异常提供尽力而为的兜底。
+3. 快照写入临时文件并 flush，再原子替换，保留一份备份。
+4. 上下文裁剪不应覆盖完整归档，工具结果与调用保持配对。
 
-PS 崩溃场景:
-
-| 崩溃类型 | 覆盖情况 |
-|---|---|
-| .NET 侧未捕获异常 | ✅ AppDomain 兜底 |
-| 用户 Alt+F4 / 正常退出 | ✅ FormClosing 兜底 |
-| Task Manager 强杀 / native 崩溃 | ✅ 增量保存兜底(最多丢当前正在跑的**一个**工具) |
-| 断电 | ✅ 增量保存兜底 |
+强杀/native 崩溃可能跳过托管回调；断电和磁盘故障也不能保证最后一次提交成功。备份是恢复辅助手段，不是对工程、CATIA 文档或外部文件操作的统一撤销保证。
 
 ---
 
 ## 部署 & 目录
 
-**发布位置**:`{PS}\{version}\eMPower\CustomizedApps\TxTools\`
+本仓库发布的是 **Agent 源码子树**，没有独立构建工程，也不包含 Siemens SDK、CATIA 互操作程序集或完整 TxTools 依赖模块。不要把仓库直接当作可独立编译的插件包。
 
-**运行时状态位置**:
-- `{plugin}\{provider}.key` — DPAPI 加密 API Key
-- `{plugin}\conversations\{id}.json` — 对话历史(协议原样存档)
-- `{plugin}\conversations\index\{id}.md` — 对话摘要索引(检索用)
-- `{plugin}\memory\snippets\*.md` / `gotchas\*.md` / `facts\*.md` / `api-notes\*.md` — 知识记忆
-- `{plugin}\recipes.json` — 配方(结构化步骤,保留 JSON)
-- `{plugin}\*.json.migrated` — 迁移到 MD 后保留的旧文件
-- `{plugin}\prefs.json` — 用户偏好(provider/model/approvalMode)
-- `{plugin}\audit.log` — 变更工具审计日志
-- `%TEMP%\TxTools.Agent\uploads\{convId}\` — 上传文件(form 关闭时清理)
-- `%USERPROFILE%\Desktop\TxTools_Exports\` — 导出的 docx/xlsx/pptx/png
+已验证集成路径是在完整 TxTools 工程中编译（Windows、.NET Framework 4.8、Visual Studio/MSBuild）。宿主还依赖 PS SDK、公共 UI、导出等模块；具体引用及包版本以宿主 `TxTools.csproj` 为准，不在此硬编码成通用安装要求。
 
-**依赖**:
-- Newtonsoft.Json 13.x —— **引用必须对齐 PS 自带的那一份**
-  (`{PS}\eMPower\Newtonsoft.Json.dll`,`Copy Local = false`)。
-  PS 进程已加载它,强名称绑定会顶掉插件引用的版本,签名对不上就 `MissingMethodException`。
-- Microsoft.Web.WebView2
-- DocumentFormat.OpenXml 2.20.0
-- Microsoft.CSharp(主项目支持 dynamic,`run_csharp` 环境不含)
+维护环境部署位置为 `{PS安装目录}/eMPower/DotNetCommands/TxTools/`。更新 DLL 前保存工程并关闭所有相关 PS 进程，备份原 DLL/PDB；界面资源内嵌于 DLL，改 HTML 后也要重新构建。
+
+**运行状态**（插件目录优先；具体存储的回退位置见对应 Store）：
+
+- `{provider}.key`：Windows DPAPI 加密 API Key。
+- `prefs.json`：provider/model/ReasoningEffort/审批模式/工具组。
+- `conversations/{id}.json` 及 `.json.bak`：对话和上一个快照。
+- `conversations/index/{id}.md`：派生检索摘要。
+- `memory/{facts,gotchas,snippets,pending,recipes,knowledge}/`：分类经验/文档。
+- `recipes.json`、`*.migrated`：历史资料，不应被误认为当前活跃脚本配方。
+- `maintenance-backup/<时间>/`：维护归档与恢复清单。
+- `audit.log`：运行审计。
+- `%TEMP%/TxTools.Agent/uploads/{convId}/`：附件暂存。
+- `%APPDATA%/TxTools/TxAgent/api_notes.json`：运行期 API 注释。
+
+Newtonsoft.Json、WebView2、Open XML、IronPython/嵌入相关组件的实际依赖以项目引用和宿主加载结果核对，尤其注意 PS 已加载程序集的版本绑定。仓库 `.gitignore` 排除构建产物、密钥、对话和运行记忆。
+
+具体维护及测试步骤见 [维护说明](maintenance/README.md)。
 
 ---
 
@@ -759,10 +720,9 @@ PS 崩溃场景:
 - **`run_csharp` 无 `dynamic`** — 用反射代替(`CatiaBridge` 就是这个风格)
 - **`GraphicViewer.GetImage` 是同步阻塞** — 抓大图(4K+)时 PS 视觉短暂无响应
 - **对话历史无跨设备同步** — 只在本机 `{plugin}\conversations\` 下
-- **未做回归测试** — prompt 或工具改动的验证只能"跑一遍看看"
-- **harness 模式无 token 级流式的思考内容** — `reasoning_content` 只有 DeepSeek reasoner 系列返回,
-  且需确认该模型支持 function calling
-- **摘要索引是规则拼装** — 不调 LLM,语义概括能力有限;好处是免费且零延迟
+- **回归范围有限** — 已有 24 项离线存储/协议/循环测试，不能替代真实 PS/CATIA 场景测试或端点兼容验证
+- **思考可用性取决于模型** — 支持真实思考流与归档；模型未返回的内容无法补写，强杀前尚未归档的片段仍可能丢失
+- **摘要索引是规则拼装** — 不调 LLM，语义概括能力有限；没有额外模型费用，但仍有 I/O 开销
 - **上下文分项用量是估算值** — 按字符数折算,非 API 精确计数
 - **知识库检索质量取决于小节标题** — 标题写「约定三」而不是「焊枪坐标系约定」,
   向量和关键字都救不了
@@ -776,9 +736,9 @@ PS 崩溃场景:
 
 **Layer 1 — 加工具**:写个 `ITxAgentTool` 实现,`AutoRegisterTools` 自动挑到,重启插件即可用。
 
-**Layer 2 — 配方 (Recipe)**:稳定的多步工具编排,用户在 UI 或让 AI `save_recipe` 定义,`RecipeStore` 加载时注册成正式工具。AI 视角与内置工具无差。
+**Layer 2 — 配方 (Recipe)**:经验证的脚本与参数声明，保存为 Markdown，可由侧栏或工具调用；与历史 JSON 步骤格式区分。
 
-**Layer 3 — 记忆学习**:AI 用 `run_csharp` 摸出新的 API 用法 → 系统自动 `SnippetStore.Upsert` 存下来 → 下轮遇到相似问题自动召回。踩过的坑 → `add_gotcha_correction` → 系统 prompt 末尾常驻。
+**Layer 3 — 记忆学习**:代码执行形成待定候选，重复不自动视为成功；验证后固化片段，按任务检索。错误正解通过 `add_gotcha_correction` 补充，按筛选与数量上限注入。
 
 ---
 

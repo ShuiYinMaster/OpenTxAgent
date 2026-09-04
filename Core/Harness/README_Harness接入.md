@@ -1,140 +1,93 @@
 # TxAgent.Core Harness 接入说明
 
-本目录（`Agent/Core/Harness/`）存放从 `files (83).zip` 引入的**通用 agent 编排骨架**（`TxAgent.Core`）以及把它接入现有 TxAgent 项目所需的**适配/桥接层**。
+更新：2026-09-04；依据源码提交 `d7433b9`。本目录已经是正式执行路径，不再是可选实验引擎。
 
-骨架本身不引用任何 Tecnomatix / CATIA / Process Simulate 类型，是模型无关、宿主无关的纯 agent 循环。接入采用**非侵入式**设计：新旧两套循环引擎通过 `IAgentLoop` 接口共存，UI 只依赖接口，默认走旧引擎，改一个开关即可切换。
+## 当前架构
 
----
+`TxAgentForm.BuildLoop` 始终创建 `HarnessAgentLoop`。旧执行循环已移除，没有 `UseNewHarness` 开关；`Core/AgentLoop.cs` 仅保留 `AgentOptions` 和系统提示词。
 
-## 一、目录结构
+| 层 | 关键文件 | 职责 |
+|---|---|---|
+| 宿主无关循环 | `AgentLoop.cs`、`AgentSession.cs`、`Messages.cs` | 模型往返、工具执行、错误处理、工作上下文 |
+| 契约 | `ILlmClient.cs`、`ITool.cs`、`IAgentHost.cs` | 模型、工具、主线程/审批/保存能力 |
+| 协议适配 | `DeepSeekLlmClient.cs` | 请求转换、真实流式、端点兼容 |
+| 宿主适配 | `PsAgentHost.cs`、`TxAgentToolAdapter.cs` | 封送 PS 调用、权限、工具结果转换 |
+| UI/归档桥 | `HarnessAgentLoop.cs`、`IAgentLoop.cs` | 记忆注入、历史同步、事件转发 |
 
-```
-Agent/Core/Harness/
-├── 骨架（原样引入，namespace = TxAgent.Core，勿改）
-│   ├── Messages.cs        ChatMessage / ToolCall / MessageRole
-│   ├── ITool.cs           ITool / ToolResult / ToolSchema
-│   ├── IAgentHost.cs      IAgentHost / HostMode / RestorePoint
-│   ├── ILlmClient.cs      ILlmClient / LlmRequest / LlmResponse
-│   ├── ToolRegistry.cs    工具注册表
-│   ├── AgentSession.cs    单次会话状态（消息、pinned、token 预算）
-│   └── AgentLoop.cs       核心循环：RunAsync / AgentLoopOptions / AgentRunResult
-│
-└── 适配 & 桥接（自研，namespace = TxTools.Agent.Harness）
-    ├── PsAgentHost.cs         实现 IAgentHost —— 把 PS 宿主接进来
-    ├── DeepSeekLlmClient.cs   实现 ILlmClient —— 桥接现有 DeepSeekClient
-    ├── TxAgentToolAdapter.cs  实现 ITool —— 包装现有 ITxAgentTool
-    ├── IAgentLoop.cs          新旧循环共享的 UI 契约接口（namespace TxTools.Agent.Core）
-    └── HarnessAgentLoop.cs    实现 IAgentLoop —— 用旧 UI 表面驱动新 harness
-```
+宿主无关内核使用 `TxAgent.Core` 命名空间；PS 适配使用 `TxTools.Agent.Harness`。并非整个目录都不依赖 PS SDK，也不是“原样引入、不能修改”的外部骨架。
 
----
+## 模型与流式路径
 
-## 二、接入架构
-
-```
-        TxAgentForm (UI)
-              │  只依赖 IAgentLoop
-      ┌───────┴────────┐
-      ▼                ▼
-  AgentLoop      HarnessAgentLoop         ← 二选一，由 UseNewHarness 开关决定
- (旧·自研)              │
-                        │ 组装并驱动
-                        ▼
-                 TxAgent.Core.AgentLoop   ← zip 引入的骨架
-                        │
-        ┌───────────────┼───────────────────┐
-        ▼               ▼                    ▼
-   PsAgentHost   DeepSeekLlmClient   TxAgentToolAdapter × N
-   (IAgentHost)   (ILlmClient)        (ITool，包住每个 ITxAgentTool)
-        │               │                    │
-        ▼               ▼                    ▼
-   PsContext/       DeepSeekClient      现有 26 个 PS 工具（零改动）
-   AuditLog/        (复用)
-   TxApplication
+```text
+TxAgentForm → HarnessAgentLoop → TxAgent.Core.AgentLoop
+  → DeepSeekLlmClient.CompleteStreamAsync
+  → DeepSeekClient.SendStreamAsync
+  → SSE reasoning/content → UI 事件
+  → 完整 tool_calls → 工具执行 → 结果回灌 → 下一次模型调用
 ```
 
-**核心思路**：现有 26 个工具、`DeepSeekClient`、`PsContext`、`AuditLog` 全部**不动**，只在外面套三层适配器，再用 `HarnessAgentLoop` 把新引擎伪装成旧 `AgentLoop` 的样子交给 UI。
+- `IStreamingLlmClient` 支持真实 SSE 边收边发，不是把完整回答切碎后的伪流式。不支持流式时退回 `CompleteAsync`。
+- `LlmResponse.ReasoningContent` 经 session 与桥接保留到归档；历史页面默认折叠展示。
+- 官方 DeepSeek V4 默认 `reasoning_effort=low`；配置允许 `high/max`。仅匹配官方域名与 V4 模型时发送参数，其他端点不套用。
+- 官方 V4 带 tools 的请求回传历史思考；存储和网络序列化分离，不把所有模型的思考无条件发给所有端点。
+- 协议转换中的两套 `ChatMessage/ToolCall` 类型不可混淆：使用别名或全限定名。
 
----
+## 生效的默认值
 
-## 三、三层适配器职责
+| 设置 | 当前宿主路径 | 说明 |
+|---|---:|---|
+| 最大模型往返 | 50 | 来自 `AgentOptions`；裸内核默认 25 |
+| 输出预算 | 12,288 / 8,192 | `OutputBudgetFor` 按模型选择；推理与正文共用 |
+| 换思路提示阈值 | 连续失败 3 次 | 提示词还要求 2 次失败后主动换验证路径 |
+| 工具失败熔断 | 连续失败 6 次 | 不是连续 3 次即中止 |
+| 模型调用重试 | 2 次 | 首次调用之外的重试 |
+| 流式 | 开启 | 还取决于客户端支持 |
+| 回滚点 | 首次写操作前尝试建立 | 不是完整工程/外部系统事务 |
+| 只读阶段 | 默认关闭 | `ReadOnlyPhase=true` 会限制暴露的工具 |
 
-### 1. `PsAgentHost` : `TxAgent.Core.IAgentHost`
-- **主线程封送**：构造接收 `SynchronizationContext`，`Invoke` / `Invoke<T>` 用 `_ctx.Send` 把工具执行封送回 PS 主线程（PS API 非线程安全）。
-- **模式探测**：`Mode` 通过反射读 `TxApplication.IsTeamcenterConnected` 决定 `Connected` / `Standalone`。
-- **确认弹窗**：`Confirm` 解析 harness 固定格式 `"工具：<name>\n参数：<json>"`，优先调 `ConfirmRequest` 委托，无委托时 fallback 到 `MessageBox`。
-- **回滚点**：`CreateRestorePoint` 反射调 `TxApplication.ActiveDocument.Save()`。
-- **日志**：`Log` 转 `AuditLog.Write`。
-- 公开属性：`ConfirmRequest`、`AutoApproveTools`。
+不要把 `AgentOptions.MaxTokens=4096`、裸内核的 `MaxTokens=16384` 当成宿主当前请求值：桥接层会传入模型对应的输出预算。
 
-### 2. `DeepSeekLlmClient` : `TxAgent.Core.ILlmClient`
-- `CompleteAsync` 把 harness 的 `LlmRequest` 翻译成旧 `ChatRequest`（消息 + 工具 schema 双向翻译），复用现有 `DeepSeekClient.SendAsync`，再把结果翻译回 `LlmResponse`。
-- 用 `using` 别名消歧义：`ChatMessage = TxTools.Agent.Core.ChatMessage`（旧）、`ToolCall = TxAgent.Core.ToolCall`（新）。
+## 线程与审批
 
-### 3. `TxAgentToolAdapter` : `TxAgent.Core.ITool`
-- 包装 `ITxAgentTool`，`Execute` 用 `host.Invoke(() => _tool.Execute(input))` 封送主线程，失败返回 `ToolResult.Fail(...)`**不抛异常**（交给 harness 的错误回灌自修机制）。
-- 写/破坏性判定保守：`IsWrite = IsDestructive = !_tool.IsReadOnly`（所有写操作都会触发确认弹窗）。
-- 静态工厂 `BuildHarnessRegistry(existing, host)` 一次性把整张旧工具表包成新 `ToolRegistry`。
+普通 PS 工具由适配器通过 `host.Invoke` 封送主线程；实现 `ITxOffUiThreadTool` 的工具在后台执行。尤其 `ask_user` 不能占住 UI 线程等待点击，否则会死锁。
 
----
+适配器将 `!IsReadOnly` 作为写入/破坏性标记，但是否弹窗还受宿主审批模式控制：
 
-## 四、如何开启 / 关闭新 harness
+- `ask`：询问模式。
+- `auto_safe`：按宿主半自动规则处理，代码审阅仍受保护。
+- `auto_all`：允许自动执行；不应在文档中承诺“每个写操作必有弹窗”。
 
-开关在 `Agent/UI/TxAgentForm.cs`：
+模式与回滚实现以 `PsAgentHost` 为准。成功保存工程不等于可以自动撤销 CATIA、文件系统或所有外部效果；恢复失败需要明确反馈。
 
-```csharp
-// 默认关闭，保证现有行为完全不变
-private const bool UseNewHarness = false;
-```
+## 历史完整性
 
-- `false`（默认）→ `BuildLoop` 走旧 `AgentLoop`，行为与接入前**逐字节一致**。
-- `true` → `BuildLoop` 走 `HarnessAgentLoop`，改用 zip 引入的新循环引擎。
+1. 模型响应携带正文、工具调用及返回的思考，加入 session。
+2. 工具结果先加入 session，再发出 `ToolFinished`，保存订阅者才能看到已配对的结果。
+3. 桥接以消息对象身份去重追加归档，不用裁剪后会错位的数值游标。
+4. `_workingMemory` 可裁剪/摘要，不能用它替换 `_fullHistory` 的旧内容。
+5. 取消、最终调用失败和只返回思考的响应也有保存路径；用未完成标记避免产生空 assistant 消息。
+6. `ConversationStore` 使用紧凑 JSON、原子替换和一个旧快照备份。不是逐 token 日志；强杀时仍可能丢失最后的未归档片段。
 
-切换只需改这一个常量，重新编译即可。UI 其余代码只认 `IAgentLoop` 接口，无需改动。
+重试时已作废的流式缓冲会清空，不将它冒充为最终回答。旧归档没有保存的思考无法从结果反推。
 
----
+## 记忆与工具策略
 
-## 五、已知取舍（切到新 harness 后的行为差异）
+基础提示由 `SystemPromptBuilder` 构建并缓存，最多注入 6 条偏好/API事实及 5 条有正解的错误经验。本轮相关片段最多 3 个，结束后清理临时注入。
 
-| 能力 | 旧 AgentLoop | 新 Harness | 说明 |
-|------|:---:|:---:|------|
-| 逐字流式输出 | ✅ | ✅(伪) | [P7] 最终消息切成片段逐字发出,模拟打字机效果;非真流式(边收边发) |
-| 错误回灌自修 | ✅ | ✅ | harness 内建,连续失败 3 次熔断 |
-| 主线程封送 | ✅ | ✅ | 由 PsAgentHost.Invoke 保证 |
-| 写操作确认弹窗 | ✅ | ✅ | 由 PsAgentHost.Confirm + Adapter 的 IsWrite 保证 |
-| 回滚点 | ✅ | ✅ | CreateRestorePoint(保存文档) |
-| 记忆注入(Facts+Gotchas) | ✅ | ✅ | [P1] Reset/LoadHistory 时调用 BuildSystemPromptWithMemory 注入 |
-| 历史压缩 | ✅ | ✅ | [P5] SendAsync 前按 MaxTurnsToKeep 压缩旧消息为摘要 |
-| AutoSnippet | ✅ | ✅ | [P4] 每轮 SendAsync 开始时按需注入 Top-3 相关 Snippet,finally 移除 |
-| AutoGotcha | ✅ | ✅ | [P3] TxAgentToolAdapter 里 run_csharp 输出含错误特征时自动落库 |
-| 经验萃取 LessonExtractor | ✅ | ✅ | [P6] 复用旧 LessonExtractor,ExtractLessonsAsync 已接入 |
-| `ask_user` 工具 | ✅ | ✅ | [P2] HarnessAgentLoop.Current 静态入口 + AskUserTool fallback 检查 |
-| 记忆工具取 convId | ✅ | ✅ | [P2] TxAgentCommand 里 convIdGetter 同时检查 AgentLoop.Current / HarnessAgentLoop.Current |
+工程任务优先：查相关经验 → API/场景只读查询 → 脚本对比筛查 → 小范围执行 → 读回复核。不要用冗长自述、手算坐标或连续微调失败代码代替验证。
 
-**结论**：新 harness 的核心增值层已全部桥接接入(P1-P7)。旧引擎的逐字流式是真流式(边收边发),harness 当前是伪流式(收到完整消息后切成片段逐字发出);若需要真流式,需扩展 ILlmClient + AgentLoop 支持流式回调,改动骨架文件。
+`PendingSnippetStore.EnableAutoPromotion=false`，重复执行不再默认晋升。片段取出仅登记候选，复用成功应由真实执行结果归因。
 
----
+## 验证状态与接入检查
 
-## 六、实际验证步骤（重要）
+已在完整 TxTools 宿主中编译通过，`maintenance/StorageRegression.cs` 的 24 项离线检查通过，覆盖协议隔离、归档读写、取消/失败、仅思考响应、备份恢复和工具结果保存顺序。前端内联 JavaScript 语法检查通过。
 
-> ⚠️ 本次接入的代码已按接口契约**静态核对**（命名空间歧义、接口成员匹配、类型别名均已处理），但**未经编译**——当前环境无可用的 C# 编译器。请务必在 Visual Studio / PS 插件工程内实际构建验证。
+尚未完成此次版本的真实端点联调与 PS/CATIA 场景回归。建议启动后依次验证：
 
-建议按 README_接入说明.md 的渐进策略验证：
+1. 只读查询 → 工具返回 → 总结，核对真实对象与数量。
+2. 正常回答和取消生成后重新打开历史，检查正文、思考和工具配对。
+3. 使用 `ask` 模式，在可恢复测试工程中验证一个小范围写操作及读回结果。
+4. 检查长对话裁剪后旧归档仍存在；模拟损坏测试只能在隔离目录进行。
+5. 切换 provider，确认不会误发官方 V4 专有字段。
 
-1. 在 Visual Studio 打开 `TxTools.csproj`，确认 `Agent\Core\Harness\*.cs` 全部 12 个文件已在编译列表（已注册）。
-2. 先保持 `UseNewHarness = false` 编译一遍，确认引入骨架**不破坏现有构建**。
-3. 把 `UseNewHarness` 改为 `true`，编译。若出现命名空间 `ChatMessage`/`ToolCall` 歧义报错，检查对应文件顶部的 `using` 别名。
-4. 启动 PS 插件，先用 **2~3 个只读工具**（如查询类）跑通"提问 → 工具调用 → 返回"闭环。
-5. 再测 **1 个写工具**，确认确认弹窗、主线程封送、回滚点正常。
-6. 闭环无误后再全量放开 26 个工具（`BuildHarnessRegistry` 已自动包全表，无需逐个加）。
-
----
-
-## 七、命名冲突备忘
-
-`TxAgent.Core`（骨架）与 `TxTools.Agent.Core`（现有）都定义了 `ChatMessage` 和 `ToolCall`。规约：
-
-- **旧类型**用 `using` 别名指向裸名：`using ChatMessage = TxTools.Agent.Core.ChatMessage;`
-- **harness 类型**一律**全限定**：`new TxAgent.Core.AgentLoop(...)`、`new TxAgent.Core.AgentSession(...)`。
-
-改动这些文件时请保持该约定，避免歧义编译错误。
+本仓库没有独立项目文件；依赖和编译入口见[主 README](../../README.md)，测试说明见[维护目录](../../maintenance/README.md)。
