@@ -111,6 +111,7 @@ namespace TxTools.Agent.Harness
                 _host.AutoApproveTools.UnionWith(_options.AutoApproveTools); // setter 私有,拷贝条目而非替换引用
 
             _llm = new DeepSeekLlmClient(_client, _options.Model);
+            ModelRouter.CurrentModelId = _options.Model;
             _llm.ReasoningEffort = UserPrefsStore.Load().ReasoningEffort;
 
             // 诊断 Newtonsoft.Json 版本冲突:PS 宿主 bin 自带一份,强名称绑定会顶掉插件引用的 13.x。

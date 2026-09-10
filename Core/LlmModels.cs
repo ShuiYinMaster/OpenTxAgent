@@ -112,10 +112,12 @@ namespace TxTools.Agent.Core
             set
             {
                 // 反序列化:API 返回的 content 一律是字符串;若是数组则把文本块拼起来
-                if (value == null) { Content = null; return; }
+                if (value == null) { Content = null; ContentParts = null; return; }
 
                 var jarr = value as Newtonsoft.Json.Linq.JArray;
-                if (jarr == null) { Content = value.ToString(); return; }
+                if (jarr == null) { Content = value.ToString(); ContentParts = null; return; }
+
+                ContentParts = jarr.ToObject<List<ContentPart>>();
 
                 var sb = new System.Text.StringBuilder();
                 foreach (var it in jarr)

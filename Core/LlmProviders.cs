@@ -46,7 +46,7 @@ namespace TxTools.Agent.Core
                 Id = "deepseek",
                 DisplayName = "DeepSeek",
                 BaseUrl = "https://api.deepseek.com",
-                Models = new[] { "deepseek-v4-pro", "deepseek-v4-flash"},
+                Models = new[] { "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"},
                 KeyPageUrl = "https://platform.deepseek.com"
             },
             new LlmProvider

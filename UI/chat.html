@@ -2026,18 +2026,11 @@ function onRestore(messages) {
             appendMessage("user", m.text);
             bubble = null;
         } else if (m.role === "assistant") {
+            // 思考属于该 assistant 段的前置内容，先创建气泡/思考块，再追加正文。
+            if (!bubble) bubble = appendMessage("assistant", "");
             if (m.reasoning) {
-                const details = document.createElement("details");
-                details.className = "msg assistant archived-reasoning";
-                const summary = document.createElement("summary");
-                summary.textContent = "思考记录（模型返回，点击展开）";
-                const body = document.createElement("pre");
-                body.style.whiteSpace = "pre-wrap";
-                body.textContent = m.reasoning;
-                details.appendChild(summary);
-                details.appendChild(body);
-                document.getElementById("chat").appendChild(details);
-                bubble = null;
+                const block = createThinkBlock(m.reasoning, false);
+                bubble.appendChild(block);
             }
             if (!bubble) {
                 // 新一轮 —— 建大气泡,text 作为首段
@@ -2066,6 +2059,21 @@ function onRestore(messages) {
     state.currentAssistantContent = null;
     state.currentAssistantBuffer = "";
     scrollToBottom();
+}
+
+function createThinkBlock(text, live) {
+    const block = document.createElement("div");
+    block.className = "think-block" + (live ? " expanded live" : "");
+    const head = document.createElement("div"); head.className = "think-head";
+    const icon = document.createElement("span"); icon.className = "th-icon"; icon.textContent = "💭";
+    const title = document.createElement("span"); title.className = "th-title";
+    title.textContent = live ? "思考中…" : "思考过程 (" + (text || "").length + " 字)";
+    const hint = document.createElement("span"); hint.className = "th-hint"; hint.textContent = live ? "▾" : "▸";
+    head.append(icon, title, hint);
+    const body = document.createElement("div"); body.className = "think-body"; body.textContent = text || "";
+    head.addEventListener("click", () => { const on = block.classList.toggle("expanded"); hint.textContent = on ? "▾" : "▸"; });
+    block.append(head, body);
+    return block;
 }
 
 /// 在已存在的 assistant 大气泡里追加一段新的 msg-content (文字段)
